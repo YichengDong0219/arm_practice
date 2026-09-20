@@ -1,0 +1,82 @@
+[
+  {
+    "path": "[Content_Types].xml",
+    "size": 1300,
+    "sha256": "e7af2c8662e430adbe1762eb5d4de15c6730492324980a889ec7ff8ada0473cd"
+  },
+  {
+    "path": "_rels/",
+    "size": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "_rels/.rels",
+    "size": 737,
+    "sha256": "514e1846381cb6bcfff105a4b0a17d666cf0ed1f0c120bff73b82226ab7ed977"
+  },
+  {
+    "path": "docProps/",
+    "size": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "docProps/app.xml",
+    "size": 634,
+    "sha256": "1c5a14c6497a40830009b152f522c37bcfafa37ffacb23e31434e437a2b198f3"
+  },
+  {
+    "path": "docProps/core.xml",
+    "size": 636,
+    "sha256": "dedccbe47d90f1267f5444c02601908d5169aa7c4a39c4c05fede2ad59e1bb20"
+  },
+  {
+    "path": "docProps/custom.xml",
+    "size": 533,
+    "sha256": "589760aecd0ca1c422bc6b1c6ad84b3e79fdd39b54031bad03b3dbb01d1e0964"
+  },
+  {
+    "path": "word/",
+    "size": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "word/_rels/",
+    "size": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "word/_rels/document.xml.rels",
+    "size": 680,
+    "sha256": "e29d9b104796908d7d043b55e6bc767ba1581684d26b8007913d516f34b65e34"
+  },
+  {
+    "path": "word/document.xml",
+    "size": 8101,
+    "sha256": "3c3dd2692a4503658d3a98a138ee58e5f1cf78fd3ebac4cdf100d79eeae2ecdc"
+  },
+  {
+    "path": "word/fontTable.xml",
+    "size": 5145,
+    "sha256": "8657e25eea7381fe375e5237c477400368b920e101feada9acfb8bd2386202e5"
+  },
+  {
+    "path": "word/settings.xml",
+    "size": 4068,
+    "sha256": "2bbbc89ee5866759a3c9877b8fb9cbd6883d247553bc0156d5b9242972c4c242"
+  },
+  {
+    "path": "word/styles.xml",
+    "size": 34916,
+    "sha256": "96488ec784df8e872076de82f85da01941aa619561ecf063ef2c16bfc0ec3ac5"
+  },
+  {
+    "path": "word/theme/",
+    "size": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "word/theme/theme1.xml",
+    "size": 3759,
+    "sha256": "77aa1cda1e4e7cf2e9b99fea288814dc7f54066ddc0292d2f3a13cdf1b9f1399"
+  }
+]

@@ -1,0 +1,56 @@
+{
+  "input": "E:\\Desktop\\\u673a\u68b0\u81c2\u5b9e\u8df5\\26\u79cb\u5b63\u521d\u7ea7\u5b9e\u8df5\u8bfe\u5b9e\u9a8c\u62a5\u544a\u6a21\u677f.docx",
+  "fonts_by_char_count": {},
+  "direct_run_formatting_runs": 4,
+  "direct_paragraph_formatting_paragraphs": 0,
+  "heading_like_paragraphs_not_heading_style": [
+    {
+      "para_index": 1,
+      "text": "\u673a\u5668\u4eba\u5b9e\u8df5\u8bfe\uff08\u673a\u68b0\u81c2\uff09\u5b9e\u9a8c\u62a5\u544a",
+      "style": "Normal"
+    },
+    {
+      "para_index": 2,
+      "text": "\u57fa\u672c\u4fe1\u606f",
+      "style": "Normal"
+    },
+    {
+      "para_index": 8,
+      "text": "\u5b9e\u9a8c1\uff1a\uff08\u586b\u5199\u5b9e\u9a8c\u9898\u76ee\uff09",
+      "style": "Normal"
+    },
+    {
+      "para_index": 19,
+      "text": "\u5b9e\u9a8c2\uff1a\uff08\u586b\u5199\u5b9e\u9a8c\u9898\u76ee\uff09",
+      "style": "Normal"
+    }
+  ],
+  "examples": {
+    "direct_run_formatting": [
+      {
+        "para_index": 1,
+        "run_text": "\u673a\u5668\u4eba\u5b9e\u8df5\u8bfe\uff08\u673a\u68b0\u81c2\uff09\u5b9e\u9a8c\u62a5\u544a",
+        "style": "Normal"
+      },
+      {
+        "para_index": 2,
+        "run_text": "\u57fa\u672c\u4fe1\u606f",
+        "style": "Normal"
+      },
+      {
+        "para_index": 8,
+        "run_text": "\u5b9e\u9a8c1\uff1a\uff08\u586b\u5199\u5b9e\u9a8c\u9898\u76ee\uff09",
+        "style": "Normal"
+      },
+      {
+        "para_index": 19,
+        "run_text": "\u5b9e\u9a8c2\uff1a\uff08\u586b\u5199\u5b9e\u9a8c\u9898\u76ee\uff09",
+        "style": "Normal"
+      }
+    ]
+  },
+  "notes": [
+    "Direct formatting is not always wrong, but it often causes inconsistent output when templates change.",
+    "Heading-like paragraphs not using Heading styles can break TOC and accessibility."
+  ]
+}
