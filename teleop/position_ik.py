@@ -1,20 +1,15 @@
-"""Constrained kinematics for cylindrical teleoperation.
+"""Bounded kinematics for the teleoperation runtime.
 
-Two orientation modes are supported:
+Physical command ranges confirmed on the real robot:
+    J1: [-90,  90] deg
+    J2: [-90,  90] deg
+    J3: [-90,  90] deg
+    J4: [-90,  25] deg
 
-FREE
-    Control radial distance r and height z. J2/J3/J4 are redundant, but J4 is
-    physically constrained to [-90, +25] deg.
+J5 range is currently unspecified.
+J6 is handled by gripper control separately.
 
-HORIZONTAL
-    Control r and z while enforcing:
-        J2 + J3 + J4 = -90 deg
-    The same physical J4 limit is enforced when selecting analytic IK branches.
-
-Important:
-Joint limits are enforced INSIDE IK. They are not merely clamped immediately
-before transmission, because doing that would make the software FK state
-diverge from the real commanded robot state.
+All IK solvers keep their internal state inside the physical J1-J4 space.
 """
 
 from __future__ import annotations
@@ -30,27 +25,83 @@ JOINT2_ZERO_DIRECTION_RAD = np.pi / 2.0
 
 DLS_DAMPING = 2.0
 IK_POSITION_TOLERANCE_MM = 1e-6
-IK_MAX_ITERATIONS = 80
+IK_MAX_ITERATIONS = 100
 MAX_INTERNAL_STEP_DEG = 5.0
 
 HORIZONTAL_JOINT_SUM_DEG = -90.0
 HORIZONTAL_TOLERANCE_DEG = 1e-9
 
-# Confirmed physical command range for Joint 4.
+JOINT1_MIN_DEG = -90.0
+JOINT1_MAX_DEG = 90.0
+JOINT2_MIN_DEG = -90.0
+JOINT2_MAX_DEG = 90.0
+JOINT3_MIN_DEG = -90.0
+JOINT3_MAX_DEG = 90.0
 JOINT4_MIN_DEG = -90.0
 JOINT4_MAX_DEG = 25.0
-JOINT_LIMIT_TOLERANCE_DEG = 1e-9
+
+IK_LOWER_DEG = np.array(
+    [JOINT2_MIN_DEG, JOINT3_MIN_DEG, JOINT4_MIN_DEG],
+    dtype=np.float64,
+)
+IK_UPPER_DEG = np.array(
+    [JOINT2_MAX_DEG, JOINT3_MAX_DEG, JOINT4_MAX_DEG],
+    dtype=np.float64,
+)
+
+XYZ_LOWER_DEG = np.array(
+    [JOINT1_MIN_DEG, JOINT2_MIN_DEG, JOINT3_MIN_DEG, JOINT4_MIN_DEG],
+    dtype=np.float64,
+)
+XYZ_UPPER_DEG = np.array(
+    [JOINT1_MAX_DEG, JOINT2_MAX_DEG, JOINT3_MAX_DEG, JOINT4_MAX_DEG],
+    dtype=np.float64,
+)
 
 
 class IKError(RuntimeError):
     """Raised when a target has no valid constrained IK solution."""
 
 
+def _inside(value: float, low: float, high: float, tol: float = 1e-9) -> bool:
+    return low - tol <= float(value) <= high + tol
+
+
+def joint1_in_limits(value: float) -> bool:
+    return _inside(value, JOINT1_MIN_DEG, JOINT1_MAX_DEG)
+
+
+def joint2_in_limits(value: float) -> bool:
+    return _inside(value, JOINT2_MIN_DEG, JOINT2_MAX_DEG)
+
+
+def joint3_in_limits(value: float) -> bool:
+    return _inside(value, JOINT3_MIN_DEG, JOINT3_MAX_DEG)
+
+
+def joint4_in_limits(value: float) -> bool:
+    return _inside(value, JOINT4_MIN_DEG, JOINT4_MAX_DEG)
+
+
+def ik_joints_in_limits(joints_deg) -> bool:
+    q = np.asarray(joints_deg, dtype=np.float64)
+    return (
+        joint2_in_limits(q[1])
+        and joint3_in_limits(q[2])
+        and joint4_in_limits(q[3])
+    )
+
+
+def arm_joints_in_limits(joints_deg) -> bool:
+    q = np.asarray(joints_deg, dtype=np.float64)
+    return joint1_in_limits(q[0]) and ik_joints_in_limits(q)
+
+
 def horizontal_sum_deg(joints_deg) -> float:
-    joints = np.asarray(joints_deg, dtype=np.float64)
-    if joints.shape != (6,):
+    q = np.asarray(joints_deg, dtype=np.float64)
+    if q.shape != (6,):
         raise ValueError("joints_deg must contain exactly 6 values")
-    return float(np.sum(joints[1:4]))
+    return float(np.sum(q[1:4]))
 
 
 def is_horizontal_pose(
@@ -58,86 +109,54 @@ def is_horizontal_pose(
     tolerance_deg: float = HORIZONTAL_TOLERANCE_DEG,
 ) -> bool:
     return abs(
-        horizontal_sum_deg(joints_deg)
-        - HORIZONTAL_JOINT_SUM_DEG
+        horizontal_sum_deg(joints_deg) - HORIZONTAL_JOINT_SUM_DEG
     ) <= tolerance_deg
 
 
-def joint4_in_limits(j4_deg: float) -> bool:
-    value = float(j4_deg)
-    return (
-        JOINT4_MIN_DEG - JOINT_LIMIT_TOLERANCE_DEG
-        <= value
-        <= JOINT4_MAX_DEG + JOINT_LIMIT_TOLERANCE_DEG
-    )
-
-
-def _require_valid_previous_joint4(previous) -> None:
-    if not joint4_in_limits(previous[3]):
-        raise IKError(
-            "current software pose is already outside the physical J4 range: "
-            f"J4={previous[3]:.3f} deg, "
-            f"allowed=[{JOINT4_MIN_DEG:.1f}, {JOINT4_MAX_DEG:.1f}] deg"
-        )
-
-
 def forward_radial_z(joints_deg) -> np.ndarray:
-    joints = np.asarray(joints_deg, dtype=np.float64)
-
-    if joints.shape != (6,):
+    q = np.asarray(joints_deg, dtype=np.float64)
+    if q.shape != (6,):
         raise ValueError("joints_deg must contain exactly 6 values")
 
-    q2 = (
-        np.deg2rad(joints[1])
-        + JOINT2_ZERO_DIRECTION_RAD
-    )
-    q3 = np.deg2rad(joints[2])
-    q4 = np.deg2rad(joints[3])
+    q2 = np.deg2rad(q[1]) + JOINT2_ZERO_DIRECTION_RAD
+    q3 = np.deg2rad(q[2])
+    q4 = np.deg2rad(q[3])
 
     q23 = q2 + q3
     q234 = q23 + q4
 
-    radial = (
+    r = (
         LINK_1_MM * np.cos(q2)
         + LINK_2_MM * np.cos(q23)
         + LINK_3_MM * np.cos(q234)
     )
-
-    z_mm = (
+    z = (
         LINK_1_MM * np.sin(q2)
         + LINK_2_MM * np.sin(q23)
         + LINK_3_MM * np.sin(q234)
     )
 
-    return np.array(
-        [radial, z_mm],
-        dtype=np.float64,
-    )
+    return np.array([r, z], dtype=np.float64)
 
 
 def radial_z_jacobian(joints_deg) -> np.ndarray:
-    joints = np.asarray(joints_deg, dtype=np.float64)
-
-    if joints.shape != (6,):
+    q = np.asarray(joints_deg, dtype=np.float64)
+    if q.shape != (6,):
         raise ValueError("joints_deg must contain exactly 6 values")
 
-    q2 = (
-        np.deg2rad(joints[1])
-        + JOINT2_ZERO_DIRECTION_RAD
-    )
-    q3 = np.deg2rad(joints[2])
-    q4 = np.deg2rad(joints[3])
+    q2 = np.deg2rad(q[1]) + JOINT2_ZERO_DIRECTION_RAD
+    q3 = np.deg2rad(q[2])
+    q4 = np.deg2rad(q[3])
 
     q23 = q2 + q3
     q234 = q23 + q4
 
-    radial = (
+    r = (
         LINK_1_MM * np.cos(q2)
         + LINK_2_MM * np.cos(q23)
         + LINK_3_MM * np.cos(q234)
     )
-
-    z_mm = (
+    z = (
         LINK_1_MM * np.sin(q2)
         + LINK_2_MM * np.sin(q23)
         + LINK_3_MM * np.sin(q234)
@@ -146,13 +165,13 @@ def radial_z_jacobian(joints_deg) -> np.ndarray:
     return np.array(
         [
             [
-                -z_mm,
+                -z,
                 -LINK_2_MM * np.sin(q23)
                 - LINK_3_MM * np.sin(q234),
                 -LINK_3_MM * np.sin(q234),
             ],
             [
-                radial,
+                r,
                 LINK_2_MM * np.cos(q23)
                 + LINK_3_MM * np.cos(q234),
                 LINK_3_MM * np.cos(q234),
@@ -162,130 +181,64 @@ def radial_z_jacobian(joints_deg) -> np.ndarray:
     )
 
 
-def forward_xyz(
-    joints_deg,
-    j1_sign: float = 1.0,
-) -> np.ndarray:
-    joints = np.asarray(
-        joints_deg,
-        dtype=np.float64,
-    )
+def forward_xyz(joints_deg, j1_sign: float = 1.0) -> np.ndarray:
+    q = np.asarray(joints_deg, dtype=np.float64)
+    if q.shape != (6,):
+        raise ValueError("joints_deg must contain exactly 6 values")
 
-    if joints.shape != (6,):
-        raise ValueError(
-            "joints_deg must contain exactly 6 values"
-        )
-
-    radial, z_mm = forward_radial_z(joints)
-
-    q1_world = (
-        float(j1_sign)
-        * np.deg2rad(joints[0])
-    )
+    r, z = forward_radial_z(q)
+    q1_world = float(j1_sign) * np.deg2rad(q[0])
 
     return np.array(
         [
-            radial * np.cos(q1_world),
-            radial * np.sin(q1_world),
-            z_mm,
+            r * np.cos(q1_world),
+            r * np.sin(q1_world),
+            z,
         ],
         dtype=np.float64,
     )
 
 
-def position_jacobian(
-    joints_deg,
-    j1_sign: float = 1.0,
-) -> np.ndarray:
-    joints = np.asarray(
-        joints_deg,
-        dtype=np.float64,
-    )
-
-    radial, _ = forward_radial_z(joints)
-    rz_j = radial_z_jacobian(joints)
+def position_jacobian(joints_deg, j1_sign: float = 1.0) -> np.ndarray:
+    q = np.asarray(joints_deg, dtype=np.float64)
+    r, _ = forward_radial_z(q)
+    rz_j = radial_z_jacobian(q)
 
     sign = float(j1_sign)
-
-    q1_world = (
-        sign * np.deg2rad(joints[0])
-    )
-
+    q1_world = sign * np.deg2rad(q[0])
     c1 = np.cos(q1_world)
     s1 = np.sin(q1_world)
 
-    x_mm = radial * c1
-    y_mm = radial * s1
-
+    x = r * c1
+    y = r * s1
     dr = rz_j[0]
     dz = rz_j[1]
 
     return np.array(
         [
-            [
-                -sign * y_mm,
-                c1 * dr[0],
-                c1 * dr[1],
-                c1 * dr[2],
-            ],
-            [
-                sign * x_mm,
-                s1 * dr[0],
-                s1 * dr[1],
-                s1 * dr[2],
-            ],
-            [
-                0.0,
-                dz[0],
-                dz[1],
-                dz[2],
-            ],
+            [-sign * y, c1 * dr[0], c1 * dr[1], c1 * dr[2]],
+            [ sign * x, s1 * dr[0], s1 * dr[1], s1 * dr[2]],
+            [0.0, dz[0], dz[1], dz[2]],
         ],
         dtype=np.float64,
     )
 
 
-def _dls_step(
-    jacobian: np.ndarray,
-    error: np.ndarray,
-    damping: float,
-) -> np.ndarray:
+def _dls_step(jacobian: np.ndarray, error: np.ndarray, damping: float) -> np.ndarray:
     system = (
         jacobian @ jacobian.T
         + float(damping) ** 2
-        * np.eye(
-            jacobian.shape[0],
-            dtype=np.float64,
-        )
+        * np.eye(jacobian.shape[0], dtype=np.float64)
     )
-
-    return (
-        jacobian.T
-        @ np.linalg.solve(
-            system,
-            error,
-        )
-    )
+    return jacobian.T @ np.linalg.solve(system, error)
 
 
-def _limit_internal_step(
-    delta_q_rad: np.ndarray,
-) -> np.ndarray:
-    max_abs = float(
-        np.max(
-            np.abs(delta_q_rad)
-        )
-    )
+def _limit_step(delta_q_rad: np.ndarray) -> np.ndarray:
+    maximum = float(np.max(np.abs(delta_q_rad)))
+    limit = np.deg2rad(MAX_INTERNAL_STEP_DEG)
 
-    max_step_rad = np.deg2rad(
-        MAX_INTERNAL_STEP_DEG
-    )
-
-    if max_abs > max_step_rad:
-        delta_q_rad = (
-            delta_q_rad
-            * (max_step_rad / max_abs)
-        )
+    if maximum > limit:
+        return delta_q_rad * (limit / maximum)
 
     return delta_q_rad
 
@@ -297,191 +250,91 @@ def solve_radial_z_with_joint_sum(
     *,
     tolerance_mm: float = IK_POSITION_TOLERANCE_MM,
 ) -> np.ndarray:
-    """Solve r,z with an exact J2+J3+J4 sum and physical J4 limits."""
-    target = np.asarray(
-        target_radial_z_mm,
-        dtype=np.float64,
-    )
-
-    previous = np.asarray(
-        previous_joints_deg,
-        dtype=np.float64,
-    )
+    """Analytic r/z + fixed pitch IK, filtered by J2/J3/J4 limits."""
+    target = np.asarray(target_radial_z_mm, dtype=np.float64)
+    previous = np.asarray(previous_joints_deg, dtype=np.float64)
 
     if target.shape != (2,):
-        raise ValueError(
-            "target_radial_z_mm must contain exactly 2 values"
-        )
-
+        raise ValueError("target_radial_z_mm must contain exactly 2 values")
     if previous.shape != (6,):
-        raise ValueError(
-            "previous_joints_deg must contain exactly 6 values"
+        raise ValueError("previous_joints_deg must contain exactly 6 values")
+    if not ik_joints_in_limits(previous):
+        raise IKError(
+            f"current J2-J4 pose is outside physical limits: "
+            f"{previous[1:4].tolist()}"
         )
-
-    if (
-        not np.all(np.isfinite(target))
-        or not np.all(np.isfinite(previous))
-    ):
-        raise ValueError(
-            "IK input must contain only finite values"
-        )
-
-    if not np.isfinite(target_joint_sum_deg):
-        raise ValueError(
-            "target_joint_sum_deg must be finite"
-        )
-
-    _require_valid_previous_joint4(previous)
 
     target_r = float(target[0])
     target_z = float(target[1])
 
-    alpha = math.radians(
-        float(target_joint_sum_deg)
-        + 90.0
-    )
+    alpha = math.radians(float(target_joint_sum_deg) + 90.0)
 
-    wrist_r = (
-        target_r
-        - LINK_3_MM * math.cos(alpha)
-    )
+    wrist_r = target_r - LINK_3_MM * math.cos(alpha)
+    wrist_z = target_z - LINK_3_MM * math.sin(alpha)
 
-    wrist_z = (
-        target_z
-        - LINK_3_MM * math.sin(alpha)
-    )
+    l1 = LINK_1_MM
+    l2 = LINK_2_MM
 
-    l1 = float(LINK_1_MM)
-    l2 = float(LINK_2_MM)
-
-    cosine_q3 = (
+    cos_q3 = (
         wrist_r * wrist_r
         + wrist_z * wrist_z
         - l1 * l1
         - l2 * l2
     ) / (2.0 * l1 * l2)
 
-    reach_tolerance = 1e-10
-
-    if (
-        cosine_q3 < -1.0 - reach_tolerance
-        or cosine_q3 > 1.0 + reach_tolerance
-    ):
+    if cos_q3 < -1.0 - 1e-10 or cos_q3 > 1.0 + 1e-10:
         raise IKError(
-            "target is geometrically unreachable: "
-            f"r={target_r:.3f} mm, "
-            f"z={target_z:.3f} mm, "
-            f"sum={target_joint_sum_deg:.3f} deg"
+            f"target is geometrically unreachable: "
+            f"r={target_r:.3f}, z={target_z:.3f}"
         )
 
-    cosine_q3 = max(
-        -1.0,
-        min(1.0, cosine_q3),
-    )
+    cos_q3 = float(np.clip(cos_q3, -1.0, 1.0))
+    q3_abs = math.acos(cos_q3)
 
-    q3_abs = math.acos(
-        cosine_q3
-    )
+    geometric = []
+    valid = []
 
-    valid_candidates = []
-    geometric_candidates = 0
-
-    for q3_model in (
-        -q3_abs,
-        q3_abs,
-    ):
-        q2_model = (
-            math.atan2(
-                wrist_z,
-                wrist_r,
-            )
-            - math.atan2(
-                l2 * math.sin(q3_model),
-                l1
-                + l2 * math.cos(q3_model),
-            )
+    for q3_model in (-q3_abs, q3_abs):
+        q2_model = math.atan2(wrist_z, wrist_r) - math.atan2(
+            l2 * math.sin(q3_model),
+            l1 + l2 * math.cos(q3_model),
         )
 
-        q2_servo_deg = (
-            math.degrees(q2_model)
-            - 90.0
-        )
-
-        q3_servo_deg = math.degrees(
-            q3_model
-        )
-
-        q4_servo_deg = (
-            float(target_joint_sum_deg)
-            - q2_servo_deg
-            - q3_servo_deg
-        )
+        q2_deg = math.degrees(q2_model) - 90.0
+        q3_deg = math.degrees(q3_model)
+        q4_deg = float(target_joint_sum_deg) - q2_deg - q3_deg
 
         candidate = previous.copy()
+        candidate[1] = q2_deg
+        candidate[2] = q3_deg
+        candidate[3] = q4_deg
 
-        candidate[1] = q2_servo_deg
-        candidate[2] = q3_servo_deg
-        candidate[3] = q4_servo_deg
-
-        position_error = float(
-            np.linalg.norm(
-                forward_radial_z(candidate)
-                - target
-            )
+        error = float(
+            np.linalg.norm(forward_radial_z(candidate) - target)
         )
 
-        if (
-            position_error
-            <= max(
-                tolerance_mm * 10.0,
-                1e-7,
-            )
-        ):
-            geometric_candidates += 1
+        if error <= max(tolerance_mm * 10.0, 1e-7):
+            geometric.append(candidate)
+            if ik_joints_in_limits(candidate):
+                valid.append(candidate)
 
-            if joint4_in_limits(
-                q4_servo_deg
-            ):
-                valid_candidates.append(
-                    candidate
-                )
-
-    if not valid_candidates:
-        if geometric_candidates:
+    if not valid:
+        if geometric:
+            descriptions = [
+                np.round(c[1:4], 3).tolist()
+                for c in geometric
+            ]
             raise IKError(
-                "target has geometric IK solutions, "
-                "but all violate the physical J4 range "
-                f"[{JOINT4_MIN_DEG:.1f}, {JOINT4_MAX_DEG:.1f}] deg"
+                "target has mathematical IK solutions, but all violate "
+                f"physical J2-J4 limits; candidates={descriptions}"
             )
 
-        raise IKError(
-            "no valid fixed-pitch IK candidate"
-        )
+        raise IKError("no valid fixed-pitch IK candidate")
 
-    best = min(
-        valid_candidates,
-        key=lambda candidate: float(
-            np.sum(
-                (
-                    candidate[1:4]
-                    - previous[1:4]
-                ) ** 2
-            )
-        ),
+    return min(
+        valid,
+        key=lambda c: float(np.sum((c[1:4] - previous[1:4]) ** 2)),
     )
-
-    best[3] = (
-        float(target_joint_sum_deg)
-        - best[1]
-        - best[2]
-    )
-
-    if not joint4_in_limits(best[3]):
-        raise IKError(
-            "internal error: selected J4 exceeds physical limit"
-        )
-
-    return best
 
 
 def solve_horizontal_radial_z(
@@ -498,100 +351,6 @@ def solve_horizontal_radial_z(
     )
 
 
-def _constrained_rz_iteration(
-    result,
-    error,
-    *,
-    damping: float,
-) -> np.ndarray:
-    """One active-set DLS step for q2/q3/q4 with a hard q4 bound."""
-    jacobian = radial_z_jacobian(
-        result
-    )
-
-    delta = _dls_step(
-        jacobian,
-        error,
-        damping,
-    )
-
-    delta = _limit_internal_step(
-        delta
-    )
-
-    delta_deg = np.rad2deg(delta)
-
-    proposed_q4 = (
-        result[3]
-        + delta_deg[2]
-    )
-
-    if (
-        JOINT4_MIN_DEG
-        <= proposed_q4
-        <= JOINT4_MAX_DEG
-    ):
-        next_result = result.copy()
-        next_result[1:4] += delta_deg
-        return next_result
-
-    # q4 wants to leave its physical interval. Move q4 only up to the
-    # relevant boundary, then use q2/q3 as the active free variables.
-    if proposed_q4 > JOINT4_MAX_DEG:
-        q4_bound = JOINT4_MAX_DEG
-    else:
-        q4_bound = JOINT4_MIN_DEG
-
-    fixed_delta_q4_rad = np.deg2rad(
-        q4_bound - result[3]
-    )
-
-    residual = (
-        error
-        - jacobian[:, 2]
-        * fixed_delta_q4_rad
-    )
-
-    free_jacobian = (
-        jacobian[:, :2]
-    )
-
-    free_delta = _dls_step(
-        free_jacobian,
-        residual,
-        damping,
-    )
-
-    combined = np.array(
-        [
-            free_delta[0],
-            free_delta[1],
-            fixed_delta_q4_rad,
-        ],
-        dtype=np.float64,
-    )
-
-    combined = _limit_internal_step(
-        combined
-    )
-
-    next_result = result.copy()
-    next_result[1:4] += np.rad2deg(
-        combined
-    )
-
-    # Numerically enforce the hard boundary.
-    next_result[3] = float(
-        np.clip(
-            next_result[3],
-            JOINT4_MIN_DEG,
-            JOINT4_MAX_DEG,
-        )
-    )
-
-    return next_result
-
-
 def solve_radial_z(
     target_radial_z_mm,
     previous_joints_deg,
@@ -600,187 +359,78 @@ def solve_radial_z(
     tolerance_mm: float = IK_POSITION_TOLERANCE_MM,
     max_iterations: int = IK_MAX_ITERATIONS,
 ) -> np.ndarray:
-    """FREE-mode constrained r/z IK.
-
-    J1/J5/J6 are preserved.
-    J4 is hard constrained to [-90, +25] deg.
-    When J4 hits a boundary, q2/q3 remain active and continue trying to
-    satisfy the Cartesian target.
-    """
-    target = np.asarray(
-        target_radial_z_mm,
-        dtype=np.float64,
-    )
-
-    previous = np.asarray(
-        previous_joints_deg,
-        dtype=np.float64,
-    )
+    """FREE-mode projected DLS with hard J2/J3/J4 bounds."""
+    target = np.asarray(target_radial_z_mm, dtype=np.float64)
+    previous = np.asarray(previous_joints_deg, dtype=np.float64)
 
     if target.shape != (2,):
-        raise ValueError(
-            "target_radial_z_mm must contain exactly 2 values"
-        )
-
+        raise ValueError("target_radial_z_mm must contain exactly 2 values")
     if previous.shape != (6,):
-        raise ValueError(
-            "previous_joints_deg must contain exactly 6 values"
+        raise ValueError("previous_joints_deg must contain exactly 6 values")
+    if not ik_joints_in_limits(previous):
+        raise IKError(
+            f"current J2-J4 pose is outside physical limits: "
+            f"{previous[1:4].tolist()}"
         )
-
-    if (
-        not np.all(np.isfinite(target))
-        or not np.all(np.isfinite(previous))
-    ):
-        raise ValueError(
-            "IK input must contain only finite values"
-        )
-
-    if damping <= 0.0:
-        raise ValueError(
-            "damping must be positive"
-        )
-
-    _require_valid_previous_joint4(
-        previous
-    )
 
     result = previous.copy()
+    last_error = None
+    stagnant = 0
 
     for _ in range(max_iterations):
-        error = (
-            target
-            - forward_radial_z(result)
-        )
+        error = target - forward_radial_z(result)
+        norm = float(np.linalg.norm(error))
 
-        if (
-            float(np.linalg.norm(error))
-            <= tolerance_mm
-        ):
-            if not joint4_in_limits(
-                result[3]
-            ):
-                raise IKError(
-                    "IK converged numerically but J4 violates its limit"
-                )
-
+        if norm <= tolerance_mm:
             return result
 
-        result = _constrained_rz_iteration(
-            result,
+        dq = _dls_step(
+            radial_z_jacobian(result),
             error,
-            damping=damping,
+            damping,
         )
+        dq = _limit_step(dq)
+
+        result[1:4] = np.clip(
+            result[1:4] + np.rad2deg(dq),
+            IK_LOWER_DEG,
+            IK_UPPER_DEG,
+        )
+
+        if last_error is not None and abs(last_error - norm) < 1e-10:
+            stagnant += 1
+        else:
+            stagnant = 0
+
+        last_error = norm
+
+        if stagnant >= 12:
+            break
 
     final_error = float(
-        np.linalg.norm(
-            target
-            - forward_radial_z(result)
-        )
+        np.linalg.norm(target - forward_radial_z(result))
     )
+
+    active = []
+    names = ("J2", "J3", "J4")
+
+    for name, value, low, high in zip(
+        names,
+        result[1:4],
+        IK_LOWER_DEG,
+        IK_UPPER_DEG,
+    ):
+        if abs(value - low) < 1e-6:
+            active.append(f"{name}=MIN({low:.1f}°)")
+        elif abs(value - high) < 1e-6:
+            active.append(f"{name}=MAX({high:.1f}°)")
+
+    suffix = f"; active limits={active}" if active else ""
 
     raise IKError(
-        "constrained FREE IK did not converge; "
-        f"remaining error={final_error:.6f} mm, "
-        f"J4={result[3]:.3f} deg, "
-        f"allowed=[{JOINT4_MIN_DEG:.1f}, {JOINT4_MAX_DEG:.1f}] deg"
+        "target is not reachable inside physical J2-J4 limits; "
+        f"remaining error={final_error:.6f} mm{suffix}"
     )
-
-
-def _constrained_xyz_iteration(
-    result,
-    error,
-    *,
-    j1_sign: float,
-    damping: float,
-) -> np.ndarray:
-    """One active-set DLS step for legacy XYZ IK with a hard J4 bound."""
-    jacobian = position_jacobian(
-        result,
-        j1_sign=j1_sign,
-    )
-
-    delta = _dls_step(
-        jacobian,
-        error,
-        damping,
-    )
-
-    delta = _limit_internal_step(
-        delta
-    )
-
-    delta_deg = np.rad2deg(
-        delta
-    )
-
-    proposed_q4 = (
-        result[3]
-        + delta_deg[3]
-    )
-
-    if (
-        JOINT4_MIN_DEG
-        <= proposed_q4
-        <= JOINT4_MAX_DEG
-    ):
-        next_result = result.copy()
-        next_result[:4] += delta_deg
-        return next_result
-
-    if proposed_q4 > JOINT4_MAX_DEG:
-        q4_bound = JOINT4_MAX_DEG
-    else:
-        q4_bound = JOINT4_MIN_DEG
-
-    fixed_delta_q4_rad = np.deg2rad(
-        q4_bound - result[3]
-    )
-
-    residual = (
-        error
-        - jacobian[:, 3]
-        * fixed_delta_q4_rad
-    )
-
-    free_jacobian = (
-        jacobian[:, :3]
-    )
-
-    free_delta = _dls_step(
-        free_jacobian,
-        residual,
-        damping,
-    )
-
-    combined = np.array(
-        [
-            free_delta[0],
-            free_delta[1],
-            free_delta[2],
-            fixed_delta_q4_rad,
-        ],
-        dtype=np.float64,
-    )
-
-    combined = _limit_internal_step(
-        combined
-    )
-
-    next_result = result.copy()
-
-    next_result[:4] += np.rad2deg(
-        combined
-    )
-
-    next_result[3] = float(
-        np.clip(
-            next_result[3],
-            JOINT4_MIN_DEG,
-            JOINT4_MAX_DEG,
-        )
-    )
-
-    return next_result
 
 
 def solve_position(
@@ -792,80 +442,48 @@ def solve_position(
     tolerance_mm: float = IK_POSITION_TOLERANCE_MM,
     max_iterations: int = IK_MAX_ITERATIONS,
 ) -> np.ndarray:
-    """Legacy XYZ IK with the same physical J4 constraint."""
-    target = np.asarray(
-        target_xyz_mm,
-        dtype=np.float64,
-    )
-
-    previous = np.asarray(
-        previous_joints_deg,
-        dtype=np.float64,
-    )
+    """Bounded XYZ DLS with J1-J4 hard limits."""
+    target = np.asarray(target_xyz_mm, dtype=np.float64)
+    previous = np.asarray(previous_joints_deg, dtype=np.float64)
 
     if target.shape != (3,):
-        raise ValueError(
-            "target_xyz_mm must contain exactly 3 values"
-        )
-
+        raise ValueError("target_xyz_mm must contain exactly 3 values")
     if previous.shape != (6,):
-        raise ValueError(
-            "previous_joints_deg must contain exactly 6 values"
+        raise ValueError("previous_joints_deg must contain exactly 6 values")
+    if not arm_joints_in_limits(previous):
+        raise IKError(
+            f"current J1-J4 pose is outside physical limits: "
+            f"{previous[:4].tolist()}"
         )
-
-    if (
-        not np.all(np.isfinite(target))
-        or not np.all(np.isfinite(previous))
-    ):
-        raise ValueError(
-            "IK input must contain only finite values"
-        )
-
-    if damping <= 0.0:
-        raise ValueError(
-            "damping must be positive"
-        )
-
-    _require_valid_previous_joint4(
-        previous
-    )
 
     result = previous.copy()
 
     for _ in range(max_iterations):
-        error = (
-            target
-            - forward_xyz(
-                result,
-                j1_sign=j1_sign,
-            )
-        )
+        error = target - forward_xyz(result, j1_sign=j1_sign)
 
-        if (
-            float(np.linalg.norm(error))
-            <= tolerance_mm
-        ):
+        if float(np.linalg.norm(error)) <= tolerance_mm:
             return result
 
-        result = _constrained_xyz_iteration(
-            result,
+        dq = _dls_step(
+            position_jacobian(result, j1_sign=j1_sign),
             error,
-            j1_sign=j1_sign,
-            damping=damping,
+            damping,
+        )
+        dq = _limit_step(dq)
+
+        result[:4] = np.clip(
+            result[:4] + np.rad2deg(dq),
+            XYZ_LOWER_DEG,
+            XYZ_UPPER_DEG,
         )
 
     final_error = float(
         np.linalg.norm(
-            target
-            - forward_xyz(
-                result,
-                j1_sign=j1_sign,
-            )
+            target - forward_xyz(result, j1_sign=j1_sign)
         )
     )
 
     raise IKError(
-        "constrained XYZ IK did not converge; "
-        f"remaining error={final_error:.6f} mm, "
-        f"J4={result[3]:.3f} deg"
+        "XYZ target is not reachable inside physical J1-J4 limits; "
+        f"remaining error={final_error:.6f} mm"
     )

@@ -236,38 +236,51 @@ def apply_base_turn(
     pose = np.asarray(pose_deg, dtype=np.float64).copy()
 
     if world_turn_sign != 0.0:
-        world_delta_deg = (
-            world_turn_sign
-            * speed_deg_s
-            * dt_s
-        )
+        world_delta_deg = world_turn_sign * speed_deg_s * dt_s
         pose[0] += world_delta_deg / float(j1_sign)
+
+    pose[0] = float(
+        np.clip(
+            pose[0],
+            position_ik.JOINT1_MIN_DEG,
+            position_ik.JOINT1_MAX_DEG,
+        )
+    )
 
     return pose
 
 
 def apply_joint_debug_limits(pose_deg) -> np.ndarray:
-    """Conservative software limits for direct joint debugging."""
     pose = np.asarray(pose_deg, dtype=np.float64).copy()
 
-    pose[0:3] = np.clip(
-        pose[0:3],
-        -DIRECT_JOINT_LIMIT_DEG,
-        DIRECT_JOINT_LIMIT_DEG,
+    pose[0] = np.clip(
+        pose[0],
+        position_ik.JOINT1_MIN_DEG,
+        position_ik.JOINT1_MAX_DEG,
     )
-
-    # Physical J4 command range.
+    pose[1] = np.clip(
+        pose[1],
+        position_ik.JOINT2_MIN_DEG,
+        position_ik.JOINT2_MAX_DEG,
+    )
+    pose[2] = np.clip(
+        pose[2],
+        position_ik.JOINT3_MIN_DEG,
+        position_ik.JOINT3_MAX_DEG,
+    )
     pose[3] = np.clip(
         pose[3],
         position_ik.JOINT4_MIN_DEG,
         position_ik.JOINT4_MAX_DEG,
     )
 
-    pose[4] = np.clip(
-        pose[4],
-        -DIRECT_JOINT_LIMIT_DEG,
-        DIRECT_JOINT_LIMIT_DEG,
-    )
+    # J5 range is not yet confirmed.
+    if "DIRECT_JOINT_LIMIT_DEG" in globals():
+        pose[4] = np.clip(
+            pose[4],
+            -DIRECT_JOINT_LIMIT_DEG,
+            DIRECT_JOINT_LIMIT_DEG,
+        )
 
     pose[5] = np.clip(
         pose[5],
@@ -290,6 +303,12 @@ def open_serial(port: str, baudrate: int):
 
 
 def send_pose(ser, pose, *, live: bool) -> None:
+    if not position_ik.arm_joints_in_limits(pose):
+        raise RuntimeError(
+            "refusing to send command outside physical J1-J4 limits: "
+            f"{np.round(np.asarray(pose)[:4], 3).tolist()}"
+        )
+
     if live:
         ser.write(
             base.pack_frame(
