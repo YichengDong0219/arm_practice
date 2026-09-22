@@ -504,7 +504,8 @@ def run_teleop(args) -> None:
                     f"theta={theta_world_deg:+7.1f}°  "
                     f"z={current_rz[1]:7.1f} mm  "
                     f"J234sum={joint_sum:+7.2f}°  "
-                    f"Grip={gripper_target_deg:+.0f}°",
+                    f"CmdJ1-6={np.round(current_pose, 2).tolist()}°  "
+                    f"GripTarget={gripper_target_deg:+.0f}°",
                     end="",
                     flush=True,
                 )
