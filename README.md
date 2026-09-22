@@ -55,6 +55,30 @@ J2 + J3 + J4 = -90°
 
 自由模式只控制末端的径向距离 `r` 和高度 `z`，不固定 J2/J3/J4 的角度和。
 
+
+### J2 构型分支 / J2 configuration branch
+
+Cartesian teleop 支持显式选择 J2 使用区域：
+
+```powershell
+--arm-branch auto
+--arm-branch negative
+--arm-branch positive
+```
+
+- `auto`: `J2 ∈ [-90°, 90°]`，优先保持当前连续构型；
+- `negative`: `J2 ∈ [-90°, 0°]`；
+- `positive`: `J2 ∈ [0°, 90°]`，启动时使用正 J2 水平准备姿态。
+
+Example:
+
+```powershell
+python teleop/keyboard_position_ik.py --live --port COM5 --orientation-mode horizontal --arm-branch positive
+```
+
+The selected branch is enforced inside IK rather than by clamping the final
+command, so the planner's internal state remains physically realizable.
+
 ### 夹爪
 
 ```text

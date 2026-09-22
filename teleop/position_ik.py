@@ -97,6 +97,31 @@ def arm_joints_in_limits(joints_deg) -> bool:
     return joint1_in_limits(q[0]) and ik_joints_in_limits(q)
 
 
+def normalize_arm_branch(arm_branch: str) -> str:
+    value = str(arm_branch).lower()
+    if value not in ("auto", "negative", "positive"):
+        raise ValueError(
+            "arm_branch must be one of: auto, negative, positive"
+        )
+    return value
+
+
+def branch_j2_bounds(arm_branch: str):
+    branch = normalize_arm_branch(arm_branch)
+
+    if branch == "positive":
+        return 0.0, JOINT2_MAX_DEG
+    if branch == "negative":
+        return JOINT2_MIN_DEG, 0.0
+
+    return JOINT2_MIN_DEG, JOINT2_MAX_DEG
+
+
+def j2_matches_branch(j2_deg: float, arm_branch: str) -> bool:
+    low, high = branch_j2_bounds(arm_branch)
+    return _inside(j2_deg, low, high)
+
+
 def horizontal_sum_deg(joints_deg) -> float:
     q = np.asarray(joints_deg, dtype=np.float64)
     if q.shape != (6,):
@@ -248,6 +273,7 @@ def solve_radial_z_with_joint_sum(
     target_joint_sum_deg: float,
     previous_joints_deg,
     *,
+    arm_branch: str = "auto",
     tolerance_mm: float = IK_POSITION_TOLERANCE_MM,
 ) -> np.ndarray:
     """Analytic r/z + fixed pitch IK, filtered by J2/J3/J4 limits."""
@@ -258,10 +284,18 @@ def solve_radial_z_with_joint_sum(
         raise ValueError("target_radial_z_mm must contain exactly 2 values")
     if previous.shape != (6,):
         raise ValueError("previous_joints_deg must contain exactly 6 values")
+    branch = normalize_arm_branch(arm_branch)
+
     if not ik_joints_in_limits(previous):
         raise IKError(
             f"current J2-J4 pose is outside physical limits: "
             f"{previous[1:4].tolist()}"
+        )
+
+    if not j2_matches_branch(previous[1], branch):
+        raise IKError(
+            f"current J2={previous[1]:.3f} deg does not belong to "
+            f"arm branch {branch!r}"
         )
 
     target_r = float(target[0])
@@ -315,7 +349,10 @@ def solve_radial_z_with_joint_sum(
 
         if error <= max(tolerance_mm * 10.0, 1e-7):
             geometric.append(candidate)
-            if ik_joints_in_limits(candidate):
+            if (
+                ik_joints_in_limits(candidate)
+                and j2_matches_branch(candidate[1], branch)
+            ):
                 valid.append(candidate)
 
     if not valid:
@@ -325,8 +362,9 @@ def solve_radial_z_with_joint_sum(
                 for c in geometric
             ]
             raise IKError(
-                "target has mathematical IK solutions, but all violate "
-                f"physical J2-J4 limits; candidates={descriptions}"
+                "target has mathematical IK solutions, but none satisfy "
+                f"physical limits + arm branch {branch!r}; "
+                f"candidates={descriptions}"
             )
 
         raise IKError("no valid fixed-pitch IK candidate")
@@ -341,12 +379,14 @@ def solve_horizontal_radial_z(
     target_radial_z_mm,
     previous_joints_deg,
     *,
+    arm_branch: str = "auto",
     tolerance_mm: float = IK_POSITION_TOLERANCE_MM,
 ) -> np.ndarray:
     return solve_radial_z_with_joint_sum(
         target_radial_z_mm,
         HORIZONTAL_JOINT_SUM_DEG,
         previous_joints_deg,
+        arm_branch=arm_branch,
         tolerance_mm=tolerance_mm,
     )
 
@@ -355,6 +395,7 @@ def solve_radial_z(
     target_radial_z_mm,
     previous_joints_deg,
     *,
+    arm_branch: str = "auto",
     damping: float = DLS_DAMPING,
     tolerance_mm: float = IK_POSITION_TOLERANCE_MM,
     max_iterations: int = IK_MAX_ITERATIONS,
@@ -367,11 +408,25 @@ def solve_radial_z(
         raise ValueError("target_radial_z_mm must contain exactly 2 values")
     if previous.shape != (6,):
         raise ValueError("previous_joints_deg must contain exactly 6 values")
+    branch = normalize_arm_branch(arm_branch)
+
     if not ik_joints_in_limits(previous):
         raise IKError(
             f"current J2-J4 pose is outside physical limits: "
             f"{previous[1:4].tolist()}"
         )
+
+    if not j2_matches_branch(previous[1], branch):
+        raise IKError(
+            f"current J2={previous[1]:.3f} deg does not belong to "
+            f"arm branch {branch!r}"
+        )
+
+    lower = IK_LOWER_DEG.copy()
+    upper = IK_UPPER_DEG.copy()
+    j2_low, j2_high = branch_j2_bounds(branch)
+    lower[0] = j2_low
+    upper[0] = j2_high
 
     result = previous.copy()
     last_error = None
@@ -393,8 +448,8 @@ def solve_radial_z(
 
         result[1:4] = np.clip(
             result[1:4] + np.rad2deg(dq),
-            IK_LOWER_DEG,
-            IK_UPPER_DEG,
+            lower,
+            upper,
         )
 
         if last_error is not None and abs(last_error - norm) < 1e-10:
@@ -417,8 +472,8 @@ def solve_radial_z(
     for name, value, low, high in zip(
         names,
         result[1:4],
-        IK_LOWER_DEG,
-        IK_UPPER_DEG,
+        lower,
+        upper,
     ):
         if abs(value - low) < 1e-6:
             active.append(f"{name}=MIN({low:.1f}°)")

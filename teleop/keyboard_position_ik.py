@@ -49,10 +49,23 @@ DEFAULT_J1_SPEED_DEG_S = 20.0
 DEFAULT_JOINT_SPEED_DEG_S = 20.0
 ORIENTATION_ALIGN_DURATION_S = 0.8
 
-PREP_POSE_DEG = np.array(
+PREP_POSE_DEFAULT_DEG = np.array(
     [0.0, 0.0, -60.0, -30.0, 0.0, 0.0],
     dtype=np.float64,
 )
+
+# Positive-J2 startup pose. It is horizontal and satisfies all known limits:
+# 20 + (-70) + (-40) = -90 deg.
+PREP_POSE_POSITIVE_DEG = np.array(
+    [0.0, 20.0, -70.0, -40.0, 0.0, 0.0],
+    dtype=np.float64,
+)
+
+
+def prep_pose_for_branch(arm_branch: str) -> np.ndarray:
+    if arm_branch == "positive":
+        return PREP_POSE_POSITIVE_DEG.copy()
+    return PREP_POSE_DEFAULT_DEG.copy()
 
 GRIPPER_OPEN_DEG = 50.0
 GRIPPER_CLOSED_DEG = -40.0
@@ -385,6 +398,7 @@ def move_pose_timed(
 def plan_orientation_alignment(
     start_pose,
     *,
+    arm_branch: str = "auto",
     duration_s: float = ORIENTATION_ALIGN_DURATION_S,
 ):
     """Plan FREE -> HORIZONTAL while holding the current r,z."""
@@ -426,6 +440,7 @@ def plan_orientation_alignment(
                 fixed_rz,
                 requested_sum,
                 previous,
+                arm_branch=arm_branch,
             )
         )
 
@@ -557,6 +572,7 @@ def print_status(
     if args.control_mode == "cartesian":
         extra = (
             f"Orient={orientation_mode.upper():10s} "
+            f"Branch={args.arm_branch.upper():8s} "
             f"r={current_rz[0]:7.1f}mm "
             f"theta={theta_world_deg:+7.1f}° "
             f"z={current_rz[1]:7.1f}mm "
@@ -605,6 +621,10 @@ def run_teleop(args) -> None:
             f"初始姿态模式: "
             f"{orientation_mode.upper()}"
         )
+        print(
+            f"J2 构型分支: "
+            f"{args.arm_branch.upper()}"
+        )
     else:
         print(
             f"关节旋转速度: "
@@ -645,7 +665,9 @@ def run_teleop(args) -> None:
         )
 
         if args.control_mode == "cartesian":
-            current_pose = PREP_POSE_DEG.copy()
+            current_pose = prep_pose_for_branch(
+                args.arm_branch
+            )
 
             if args.live:
                 print("平滑进入准备姿态...")
@@ -692,6 +714,9 @@ def run_teleop(args) -> None:
                     ),
                     "orientation_mode_initial": (
                         orientation_mode
+                    ),
+                    "arm_branch": (
+                        args.arm_branch
                     ),
                     "control_rate_hz": (
                         CONTROL_RATE_HZ
@@ -763,6 +788,7 @@ def run_teleop(args) -> None:
                             planned = (
                                 plan_orientation_alignment(
                                     current_pose,
+                                    arm_branch=args.arm_branch,
                                     duration_s=(
                                         ORIENTATION_ALIGN_DURATION_S
                                     ),
@@ -851,6 +877,7 @@ def run_teleop(args) -> None:
                                 .solve_horizontal_radial_z(
                                     candidate_rz,
                                     current_pose,
+                                    arm_branch=args.arm_branch,
                                 )
                             )
 
@@ -860,6 +887,7 @@ def run_teleop(args) -> None:
                                 .solve_radial_z(
                                     candidate_rz,
                                     current_pose,
+                                    arm_branch=args.arm_branch,
                                 )
                             )
 
@@ -1133,6 +1161,16 @@ def main(argv=None) -> None:
         "--joint-speed",
         type=positive_float,
         default=DEFAULT_JOINT_SPEED_DEG_S,
+    )
+
+    parser.add_argument(
+        "--arm-branch",
+        choices=("auto", "negative", "positive"),
+        default="auto",
+        help=(
+            "J2 构型区域：auto=[-90,90]；"
+            "negative=[-90,0]；positive=[0,90]"
+        ),
     )
 
     parser.add_argument(
