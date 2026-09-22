@@ -250,8 +250,21 @@ def apply_joint_debug_limits(pose_deg) -> np.ndarray:
     """Conservative software limits for direct joint debugging."""
     pose = np.asarray(pose_deg, dtype=np.float64).copy()
 
-    pose[:5] = np.clip(
-        pose[:5],
+    pose[0:3] = np.clip(
+        pose[0:3],
+        -DIRECT_JOINT_LIMIT_DEG,
+        DIRECT_JOINT_LIMIT_DEG,
+    )
+
+    # Physical J4 command range.
+    pose[3] = np.clip(
+        pose[3],
+        position_ik.JOINT4_MIN_DEG,
+        position_ik.JOINT4_MAX_DEG,
+    )
+
+    pose[4] = np.clip(
+        pose[4],
         -DIRECT_JOINT_LIMIT_DEG,
         DIRECT_JOINT_LIMIT_DEG,
     )
