@@ -34,7 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import task8 as base
+from teleop import hardware as base
 from teleop import position_ik
 from teleop.trajectory_io import TrajectoryRecorder, default_recording_path
 

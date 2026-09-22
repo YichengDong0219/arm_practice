@@ -1,28 +1,14 @@
-# Python
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
 .pytest_cache/
-.mypy_cache/
-
-# Environments
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
 .venv/
 venv/
 env/
 .env/
 
-# Editors / OS
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
-
-# Development/update artifacts
-arm_update_*.py
-release_v*.py
-
-# Generated teleoperation data
 teleop/recordings/*
 !teleop/recordings/.gitignore
-teleop/calibration/

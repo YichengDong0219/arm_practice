@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import task8 as base
+from teleop import hardware as base
 from teleop.trajectory_io import (
     load_metadata,
     load_trajectory,

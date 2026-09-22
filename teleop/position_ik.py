@@ -12,7 +12,11 @@ from __future__ import annotations
 
 import math
 import numpy as np
-import task8_reverse as geometry
+
+LINK_1_MM = 120.0
+LINK_2_MM = 120.0
+LINK_3_MM = 140.0
+JOINT2_ZERO_DIRECTION_RAD = np.pi / 2.0
 
 
 DLS_DAMPING = 2.0
@@ -49,7 +53,7 @@ def forward_radial_z(joints_deg) -> np.ndarray:
     if joints.shape != (6,):
         raise ValueError("joints_deg must contain exactly 6 values")
 
-    q2 = np.deg2rad(joints[1]) + geometry.JOINT2_ZERO_DIRECTION_RAD
+    q2 = np.deg2rad(joints[1]) + JOINT2_ZERO_DIRECTION_RAD
     q3 = np.deg2rad(joints[2])
     q4 = np.deg2rad(joints[3])
 
@@ -57,14 +61,14 @@ def forward_radial_z(joints_deg) -> np.ndarray:
     q234 = q23 + q4
 
     radial = (
-        geometry.LINK_1_MM * np.cos(q2)
-        + geometry.LINK_2_MM * np.cos(q23)
-        + geometry.LINK_3_MM * np.cos(q234)
+        LINK_1_MM * np.cos(q2)
+        + LINK_2_MM * np.cos(q23)
+        + LINK_3_MM * np.cos(q234)
     )
     z_mm = (
-        geometry.LINK_1_MM * np.sin(q2)
-        + geometry.LINK_2_MM * np.sin(q23)
-        + geometry.LINK_3_MM * np.sin(q234)
+        LINK_1_MM * np.sin(q2)
+        + LINK_2_MM * np.sin(q23)
+        + LINK_3_MM * np.sin(q234)
     )
 
     return np.array([radial, z_mm], dtype=np.float64)
@@ -75,7 +79,7 @@ def radial_z_jacobian(joints_deg) -> np.ndarray:
     if joints.shape != (6,):
         raise ValueError("joints_deg must contain exactly 6 values")
 
-    q2 = np.deg2rad(joints[1]) + geometry.JOINT2_ZERO_DIRECTION_RAD
+    q2 = np.deg2rad(joints[1]) + JOINT2_ZERO_DIRECTION_RAD
     q3 = np.deg2rad(joints[2])
     q4 = np.deg2rad(joints[3])
 
@@ -83,29 +87,29 @@ def radial_z_jacobian(joints_deg) -> np.ndarray:
     q234 = q23 + q4
 
     radial = (
-        geometry.LINK_1_MM * np.cos(q2)
-        + geometry.LINK_2_MM * np.cos(q23)
-        + geometry.LINK_3_MM * np.cos(q234)
+        LINK_1_MM * np.cos(q2)
+        + LINK_2_MM * np.cos(q23)
+        + LINK_3_MM * np.cos(q234)
     )
     z_mm = (
-        geometry.LINK_1_MM * np.sin(q2)
-        + geometry.LINK_2_MM * np.sin(q23)
-        + geometry.LINK_3_MM * np.sin(q234)
+        LINK_1_MM * np.sin(q2)
+        + LINK_2_MM * np.sin(q23)
+        + LINK_3_MM * np.sin(q234)
     )
 
     return np.array(
         [
             [
                 -z_mm,
-                -geometry.LINK_2_MM * np.sin(q23)
-                - geometry.LINK_3_MM * np.sin(q234),
-                -geometry.LINK_3_MM * np.sin(q234),
+                -LINK_2_MM * np.sin(q23)
+                - LINK_3_MM * np.sin(q234),
+                -LINK_3_MM * np.sin(q234),
             ],
             [
                 radial,
-                geometry.LINK_2_MM * np.cos(q23)
-                + geometry.LINK_3_MM * np.cos(q234),
-                geometry.LINK_3_MM * np.cos(q234),
+                LINK_2_MM * np.cos(q23)
+                + LINK_3_MM * np.cos(q234),
+                LINK_3_MM * np.cos(q234),
             ],
         ],
         dtype=np.float64,
@@ -190,11 +194,11 @@ def solve_radial_z_with_joint_sum(
     target_z = float(target[1])
     alpha = math.radians(float(target_joint_sum_deg) + 90.0)
 
-    wrist_r = target_r - geometry.LINK_3_MM * math.cos(alpha)
-    wrist_z = target_z - geometry.LINK_3_MM * math.sin(alpha)
+    wrist_r = target_r - LINK_3_MM * math.cos(alpha)
+    wrist_z = target_z - LINK_3_MM * math.sin(alpha)
 
-    l1 = float(geometry.LINK_1_MM)
-    l2 = float(geometry.LINK_2_MM)
+    l1 = float(LINK_1_MM)
+    l2 = float(LINK_2_MM)
 
     cosine_q3 = (
         wrist_r * wrist_r
