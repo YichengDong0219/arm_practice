@@ -33,8 +33,8 @@ python teleop/keyboard_position_ik.py --live --port COM5 --orientation-mode free
 | 按键 | 功能 |
 |---|---|
 | `P` | 开始控制 |
-| `A / ←` | J1 左转 / 俯视逆时针 |
-| `D / →` | J1 右转 / 俯视顺时针 |
+| `A / ←` | J1 右转 / 俯视顺时针 |
+| `D / →` | J1 左转 / 俯视逆时针 |
 | `W / ↑` | 径向前进 |
 | `S / ↓` | 径向后退 |
 | `Q` | 上升 |
@@ -139,8 +139,8 @@ Omit `--live` for dry run.
 | Key | Action |
 |---|---|
 | `P` | Start |
-| `A / ←` | Rotate J1 left / CCW |
-| `D / →` | Rotate J1 right / CW |
+| `A / ←` | Rotate J1 right / CW |
+| `D / →` | Rotate J1 left / CCW |
 | `W / ↑` | Radially forward |
 | `S / ↓` | Radially backward |
 | `Q` | Up |

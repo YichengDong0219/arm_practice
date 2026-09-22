@@ -172,25 +172,25 @@ def radial_vertical_command() -> np.ndarray:
 
 
 def turn_command() -> float:
+    """A = J1 negative / clockwise; D = J1 positive / counter-clockwise."""
     value = 0.0
 
     if key_down(VK_A) or key_down(VK_LEFT):
-        value += 1.0
-    if key_down(VK_D) or key_down(VK_RIGHT):
         value -= 1.0
+    if key_down(VK_D) or key_down(VK_RIGHT):
+        value += 1.0
 
     return value
-
 
 def joint_keyboard_command() -> np.ndarray:
     """Return +/- velocity commands for J1..J6 in JOINT mode."""
     command = np.zeros(6, dtype=np.float64)
 
-    # J1
+    # J1: reversed A/D meaning
     if key_down(VK_A):
-        command[0] += 1.0
-    if key_down(VK_D):
         command[0] -= 1.0
+    if key_down(VK_D):
+        command[0] += 1.0
 
     # J2
     if key_down(VK_W):
@@ -223,7 +223,6 @@ def joint_keyboard_command() -> np.ndarray:
         command[5] -= 1.0
 
     return command
-
 
 def apply_base_turn(
     pose_deg,
@@ -497,8 +496,8 @@ def print_control_help(args) -> None:
 
     if args.control_mode == "cartesian":
         print("=== CARTESIAN 末端遥操作 ===")
-        print("A / ← : J1 左转 / 逆时针")
-        print("D / → : J1 右转 / 顺时针")
+        print("A / ← : J1 右转 / 顺时针")
+        print("D / → : J1 左转 / 逆时针")
         print("W / ↑ : 径向前进")
         print("S / ↓ : 径向后退")
         print("Q     : 上升")
@@ -510,7 +509,7 @@ def print_control_help(args) -> None:
 
     else:
         print("=== JOINT 关节调试 ===")
-        print("J1: A / D = + / -")
+        print("J1: A / D = - / +")
         print("J2: W / S = + / -")
         print("J3: Q / E = + / -")
         print("J4: R / F = + / -")
