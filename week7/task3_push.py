@@ -269,6 +269,20 @@ def best_margin(p, pitch_deg):
 FINE_PITCH_DEG = np.arange(-85.0, -15.0, 0.5)
 
 
+def approach_pitch(hover, pre_touch, contact_pitch, min_margin=JOINT_MARGIN_DEG + 1.0):
+    """悬停点倾角：尽量接近接触倾角，并保证悬停→预接触按线性过渡的整段都可行。
+
+    远处外围块接近手臂伸直（J3≈0），逐点“就近可行”会让肘部解跳变，
+    因此只选一个悬停倾角，下降段在两者之间线性过渡。
+    """
+    hover, pre_touch = np.asarray(hover, float), np.asarray(pre_touch, float)
+    for hp in sorted(FINE_PITCH_DEG, key=lambda x: abs(x - contact_pitch)):
+        if all(best_margin(hover + s * (pre_touch - hover), (1 - s) * hp + s * contact_pitch)
+               >= min_margin for s in np.linspace(0.0, 1.0, 9)):
+            return float(hp)
+    raise IKError(f"悬停点 {np.round(hover, 1)} 到预接触点之间找不到连续可行的倾角过渡")
+
+
 def nearest_feasible_pitch(p, target, min_margin=JOINT_MARGIN_DEG + 1.0):
     """离 target 最近、且关节余量足够的倾角（用于悬停与下降段，保持姿态尽量不变）。"""
     for pt in sorted(FINE_PITCH_DEG, key=lambda x: abs(x - target)):
@@ -504,7 +518,10 @@ def movel(label, kind, p0, p1, tilt, q_prev, speed, block, in_contact, blend=Non
     p0, p1 = np.asarray(p0, float), np.asarray(p1, float)
     q_start = q_prev
     duration = max(0.6, float(np.linalg.norm(p1 - p0)) / speed)
+    base_duration = duration
     for _ in range(8):  # 若关节角速度超限，则放慢该段重新插值
+        if duration > 4.0 * base_duration:
+            raise IKError(f"{label}: 关节角出现跳变（逆解分支或倾角不连续），放慢也无法满足角速度限制")
         s = quintic(n_samples(duration))[:, None]
         pts = p0 + s * (p1 - p0)
         qs, pitches, q_prev = [], [], q_start
@@ -573,9 +590,8 @@ def build_plan(task, only=None):
             dense += [a + t * (b - a) for t in np.linspace(0, 1, 8)]
         tilt, m = choose_tilt(np.array(dense), schedule)
         info[k]["tilt"], info[k]["tilt_margin"] = tilt, m
-        # 悬停与下降段：倾角尽量等于接触倾角，不可行处取最近的可行值
-        info[k]["approach_tilt"] = TiltPlan("nearest", value=tilt.pitch(info[k]["pre_touch"]))
-        info[k]["hover_pitch"] = info[k]["approach_tilt"].pitch(info[k]["hover"])
+        info[k]["hover_pitch"] = approach_pitch(
+            info[k]["hover"], info[k]["pre_touch"], tilt.pitch(info[k]["pre_touch"]))
 
     ready_p = fig_to_base((0.0, 0.0), top + READY_HEIGHT)
     q_zero = np.zeros(5)
@@ -598,8 +614,9 @@ def build_plan(task, only=None):
         tilt = b["tilt"]
         q_hover = solve_ik(b["hover"], b["hover_pitch"], q_cur)
         segs.append(movej(f"{k}/to_hover", q_cur, q_hover, block=k))
-        seg = movel(f"{k}/descend", "descend", b["hover"], b["pre_touch"], b["approach_tilt"],
-                    q_hover, DESCEND_SPEED, k, in_contact=False)
+        seg = movel(f"{k}/descend", "descend", b["hover"], b["pre_touch"], tilt, q_hover,
+                    DESCEND_SPEED, k, in_contact=False,
+                    blend=(b["hover_pitch"], tilt.pitch(b["pre_touch"])))
         segs.append(seg)
         seg = movel(f"{k}/press", "press", b["pre_touch"], b["route_base"][0], tilt,
                     seg.q[-1, :5], PRESS_SPEED, k, in_contact=True)
