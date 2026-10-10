@@ -371,8 +371,10 @@ def task_layout(task):
             "a": [outer["a"], slots["TL"]],
             # b：斜穿空着的右上/右下区域到转向点，再沿下方通道左移，最后上插 m
             "b": [outer["b"], (s + m, -s - m), (-s, -s - m), slots["BL"]],
-            # c：先沿最下方右移，再沿右侧通道上行，最后左插 m
-            "c": [outer["c"], (s + m, -D), (s + m, s), slots["TR"]],
+            # c：先沿已到位 b 下方的通道右移（与选做一 b 的上方通道对称，
+            #    比沿外围下排 v=-D 走离基座更远，关节余量更大），再沿右侧通道
+            #    上行穿过空着的右下区域，最后左插 m
+            "c": [outer["c"], (s + m, -(s + h + m)), (s + m, s), slots["TR"]],
             "d": [outer["d"], slots["BR"]],
         }
     else:
@@ -401,8 +403,9 @@ class Plan:
     task: int
     segments: list = field(default_factory=list)
     blocks: dict = field(default_factory=dict)   # 每块的布局/倾角/关键点信息
-    order: list = field(default_factory=list)
+    order: list = field(default_factory=list)    # 本次实际执行的木块顺序
     checks: dict = field(default_factory=dict)
+    initial_xy: dict = field(default_factory=dict)  # 开始时四块的位置（基座系 XY）
 
 
 def quintic(n):
@@ -477,8 +480,20 @@ def block_geometry(task):
     return info, order
 
 
-def build_plan(task):
-    info, order = block_geometry(task)
+def build_plan(task, only=None):
+    """only：只执行其中的木块（单块验证用）。顺序在它们之前的木块视为已在
+    内围目标，之后的仍在外围起点；请在运动前按此手工摆放。"""
+    info, full_order = block_geometry(task)
+    only = set(only or full_order)
+    unknown = only - set(full_order)
+    if unknown:
+        raise ValueError(f"未知木块：{sorted(unknown)}")
+    order = [k for k in full_order if k in only]
+    initial_xy = {}
+    for i, k in enumerate(full_order):
+        placed_before = k not in only and i < max(full_order.index(x) for x in only)
+        route = info[k]["route_base"]
+        initial_xy[k] = (route[-1] if placed_before else route[0])[:2].copy()
     top = TABLE_Z + BLOCK_SIZE
     schedule = fit_tilt_schedule(top - PRESS_DEPTH)
 
@@ -496,7 +511,7 @@ def build_plan(task):
     q_zero = np.zeros(5)
     q_ready = solve_ik(ready_p, point_pitch(ready_p, schedule))
 
-    plan = Plan(task=task, order=order, blocks=info)
+    plan = Plan(task=task, order=order, blocks=info, initial_xy=initial_xy)
     plan.blocks["_ready"] = {"point": ready_p, "q": q_ready, "schedule": schedule}
     segs = plan.segments
 
@@ -566,9 +581,8 @@ def inside_footprint(p, center, expand):
 
 
 def check_plan(plan, stride=1, raise_on_fail=True):
-    info = plan.blocks
     top = TABLE_Z + BLOCK_SIZE
-    positions = {k: info[k]["route_base"][0][:2].copy() for k in plan.order}
+    positions = {k: v.copy() for k, v in plan.initial_xy.items()}
     issue_map = {}
 
     class _Issues(list):
@@ -710,9 +724,16 @@ def summarize(plan):
     return "\n".join(lines)
 
 
+def plan_tag(plan):
+    tag = f"task{plan.task}"
+    if len(plan.order) < len(plan.initial_xy):
+        tag += "_only_" + "".join(plan.order)
+    return tag
+
+
 def export_plan(plan, out_dir):
     out_dir.mkdir(parents=True, exist_ok=True)
-    stem = out_dir / f"task{plan.task}"
+    stem = out_dir / plan_tag(plan)
     with open(f"{stem}_trajectory.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["t_s", "segment", "block", "q1", "q2", "q3", "q4", "q5", "q6",
@@ -779,6 +800,10 @@ def draw_layout(plan, ax):
         ax.plot(r[:, 0], r[:, 1], "-", color=COLORS[k], lw=1.6)
         ax.annotate(f"{plan.order.index(k) + 1}", r[0][:2] + np.array([0, 14]),
                     color=COLORS[k], fontsize=8, ha="center")
+    for k, xy in plan.initial_xy.items():   # --only 时不动的木块画成灰色障碍
+        if k not in plan.order:
+            _square(ax, xy, facecolor="0.75", edgecolor="0.3", lw=0.8)
+            ax.text(*xy, k, ha="center", va="center", fontsize=10)
     ax.plot(*WORK_CENTER_XY, "k.", ms=6)
     ax.plot(0, 0, "ks", ms=8)
     ax.set_aspect("equal")
@@ -827,9 +852,9 @@ def animate_plan(plan, speed=3.0):
     import matplotlib.pyplot as plt
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 6))
     draw_layout(plan, ax1)
-    positions = {k: plan.blocks[k]["route_base"][0][:2].copy() for k in plan.order}
+    positions = {k: v.copy() for k, v in plan.initial_xy.items()}
     patches = {k: _square(ax1, positions[k], facecolor=COLORS[k], alpha=0.85, zorder=5)
-               for k in plan.order}
+               for k in positions}
     (arm_top,) = ax1.plot([], [], "-o", color="0.2", ms=3, zorder=6)
     (trace,) = ax1.plot([], [], color="darkorange", lw=1.2, zorder=7)
     (arm_side,) = ax2.plot([], [], "-o", color="0.2", ms=4)
@@ -1008,6 +1033,8 @@ def main():
     ap.add_argument("--press", type=float, help="下压量 δ（mm）")
     ap.add_argument("--calib-block", choices=BLOCK_NAMES, default="a")
     ap.add_argument("--step", action="store_true", help="实机每块下降前回车确认（调试用）")
+    ap.add_argument("--only", nargs="+", choices=BLOCK_NAMES,
+                    help="只执行这些木块（单块验证绕行）；其余木块按提示手工摆放")
     ap.add_argument("--viewer", choices=("2d", "rtb", "none"), default="2d")
     ap.add_argument("--speed", type=float, default=3.0, help="仿真回放倍速")
     args = ap.parse_args()
@@ -1047,10 +1074,16 @@ def main():
             ser.close()
         return
 
-    plan = build_plan(args.task)
+    plan = build_plan(args.task, only=args.only)
     raise_now = args.mode == "hardware"
     check_plan(plan, raise_on_fail=raise_now)
     print(summarize(plan))
+    if args.only:
+        print("单块验证的起始摆放（基座系 XY，mm）：")
+        for k, xy in plan.initial_xy.items():
+            state = "执行" if k in plan.order else (
+                "已在内围目标" if np.allclose(xy, plan.blocks[k]["route_base"][-1][:2]) else "外围起点")
+            print(f"  {k}: {np.round(xy, 1)}  [{state}]")
     rtb_err = cross_check_rtb(plan)
     if rtb_err is not None:
         print(f"roboticstoolbox 正解复核：最大差异 {rtb_err:.2e} mm")
@@ -1059,7 +1092,7 @@ def main():
 
     out_dir = OUTPUT_DIR
     csv_path, json_path = export_plan(plan, out_dir)
-    fig_path = out_dir / f"task{args.task}_overview.png"
+    fig_path = out_dir / f"{plan_tag(plan)}_overview.png"
     save_overview_figure(plan, fig_path)
     print(f"已导出：{csv_path.name}、{json_path.name}、{fig_path.name}（目录 {out_dir}）")
 
