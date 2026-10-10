@@ -112,8 +112,15 @@ LIFT_TIME = 0.8
 LIFT_MIN_CLEAR = 5.0      # 抬离后接触点至少高出块顶
 
 # 倾角：tool_pitch = 夹爪轴线相对水平面的俯仰（负值朝下），等于 q2+q3+q4+90°
-TILT_MODE = "auto"          # auto：能固定就固定，否则按半径排程；或 "fixed"/"radial"
-TILT_FIXED_MIN_MARGIN = 6.0  # 固定倾角整段的最小关节余量要求（deg）
+TILT_MODE = "auto"          # auto：能固定就固定，否则按位置排程；或 "fixed"/"radial"
+# 接触倾角的选择目标：
+#   "steep"  在关节余量 ≥ TILT_CONTACT_MIN_MARGIN 的前提下取最陡（最朝下）的倾角。
+#            夹指端面与桌面夹角 = 90° - |倾角|，越陡端面越平、与块顶接触面越大。
+#   "margin" 取关节余量最大的倾角（旧行为，远处会偏平，接触只剩棱边）。
+TILT_OBJECTIVE = "steep"
+TILT_CONTACT_MIN_MARGIN = 4.0  # steep 目标下接触段的最小关节余量（陡端受 J4 下限 -90° 限制）
+TILT_FIXED_MAX_LOSS = 3.0      # auto：固定倾角比逐点最陡平均浅不超过该值才用固定
+TILT_FIXED_MIN_MARGIN = 6.0    # margin 目标下固定倾角的最小关节余量；也用于非接触点
 TILT_SEARCH_DEG = np.arange(-85.0, -15.0, 1.0)
 
 # 净空检查
@@ -259,34 +266,88 @@ def best_margin(p, pitch_deg):
 # 5. 倾角选择：固定倾角 / 按半径排程
 # ============================================================
 
+FINE_PITCH_DEG = np.arange(-85.0, -15.0, 0.5)
+
+
+def nearest_feasible_pitch(p, target, min_margin=JOINT_MARGIN_DEG + 1.0):
+    """离 target 最近、且关节余量足够的倾角（用于悬停与下降段，保持姿态尽量不变）。"""
+    for pt in sorted(FINE_PITCH_DEG, key=lambda x: abs(x - target)):
+        if best_margin(p, pt) >= min_margin:
+            return float(pt)
+    raise IKError(f"点 {np.round(p, 1)} mm 在任何倾角下都没有足够的关节余量")
+
+
 @dataclass
 class TiltPlan:
-    mode: str              # "fixed" or "radial"
-    value: float = 0.0     # fixed 时的倾角
+    mode: str              # "fixed" / "radial" / "table" / "nearest"
+    value: float = 0.0     # fixed 的倾角；nearest 的目标倾角
     coef: tuple = (0.0, 0.0, 0.0)  # radial 时 pitch = k_r·r + k_z·z + b
+    table: tuple = ()      # table 时 (半径网格, 高度列表, 每个高度的倾角数组)
 
     def pitch(self, p):
         if self.mode == "fixed":
             return self.value
+        if self.mode == "nearest":
+            return nearest_feasible_pitch(p, self.value)
         r = float(np.hypot(p[0], p[1]))
+        if self.mode == "table":
+            radii, heights, rows = self.table
+            vals = [float(np.interp(r, radii, row)) for row in rows]
+            return float(np.interp(p[2], heights, vals))
         return float(self.coef[0] * r + self.coef[1] * p[2] + self.coef[2])
 
     def describe(self):
+        if self.mode == "table":
+            return "逐点最陡可行（查表插值）"
+        if self.mode == "nearest":
+            return f"就近可行（目标 {self.value:.1f}°）"
         if self.mode == "fixed":
             return f"固定 {self.value:.1f}°"
         k_r, k_z, b = self.coef
         return f"按位置排程 {k_r:.3f}·r {k_z:+.3f}·z {b:+.1f}°"
 
 
-def fit_tilt_schedule(z_contact):
-    """在接触高度及其上方若干高度，逐点找关节余量最大的倾角，再做 (r, z) 线性拟合。"""
+def steepest_pitch(p, min_margin):
+    """该点关节余量不低于 min_margin 时可取的最陡倾角；不存在则返回 None。"""
+    ok = [pt for pt in TILT_SEARCH_DEG if best_margin(p, pt) >= min_margin]
+    return float(min(ok)) if ok else None
+
+
+def fit_tilt_schedule(z_contact, objective=None):
+    """逐点求目标倾角，再做 (r, z) 线性拟合。
+
+    steep：接触高度附近取最陡可行倾角（留 1.5° 拟合余量）；
+    margin：在接触高度到高位之间取关节余量最大的倾角。
+    """
+    objective = objective or TILT_OBJECTIVE
+    if objective == "steep":
+        # 最陡可行倾角随半径是“近处平、远处陡降”的曲线，线性拟合会在远处偏平，
+        # 因此在接触高度与预接触高度上逐 5 mm 查表，留 0.5° 余量后插值。
+        heights = [float(z_contact), float(z_contact + PRE_TOUCH_HEIGHT + PRESS_DEPTH)]
+        radii = np.arange(150.0, 345.0, 5.0)
+        table_rows = []
+        for z in heights:
+            row = []
+            for r in radii:
+                ok = [pt for pt in FINE_PITCH_DEG
+                      if best_margin((r, 0.0, z), pt) >= TILT_CONTACT_MIN_MARGIN + 0.5]
+                row.append(min(ok) if ok else np.nan)
+            row = np.array(row)
+            valid = ~np.isnan(row)
+            if valid.sum() < 2:
+                raise IKError("可达点过少，无法建立倾角表")
+            row[~valid] = np.interp(radii[~valid], radii[valid], row[valid])
+            table_rows.append(row)
+        return TiltPlan("table", table=(radii, heights, table_rows))
     rows, pitches = [], []
     for z in z_contact + np.array([0.0, 20.0, 45.0, 90.0]):
         for r in np.arange(160.0, 340.0, 10.0):
-            m, pt = max((best_margin((r, 0.0, z), pt), pt) for pt in TILT_SEARCH_DEG)
-            if m > 0:
-                rows.append([r, z, 1.0])
-                pitches.append(pt)
+            p = (r, 0.0, z)
+            m, pt = max((best_margin(p, x), x) for x in TILT_SEARCH_DEG)
+            if m <= 0:
+                continue
+            rows.append([r, z, 1.0])
+            pitches.append(pt)
     if len(rows) < 3:
         raise IKError("可达点过少，无法建立倾角排程")
     coef, *_ = np.linalg.lstsq(np.array(rows), np.array(pitches), rcond=None)
@@ -307,14 +368,21 @@ def point_pitch(p, schedule, min_margin=TILT_FIXED_MIN_MARGIN):
 def choose_tilt(points, schedule):
     """为一块木块的全部关键接触点选倾角：优先整段固定倾角。"""
     points = np.atleast_2d(points)
+    common = {pt: min(best_margin(p, pt) for p in points) for pt in TILT_SEARCH_DEG}
     if TILT_MODE in ("auto", "fixed"):
-        best = (-np.inf, None)
-        for pt in TILT_SEARCH_DEG:
-            m = min(best_margin(p, pt) for p in points)
-            if m > best[0]:
-                best = (m, pt)
-        if best[0] >= TILT_FIXED_MIN_MARGIN or (TILT_MODE == "fixed" and best[0] > JOINT_MARGIN_DEG):
-            return TiltPlan("fixed", value=float(best[1])), best[0]
+        if TILT_OBJECTIVE == "steep":
+            ok = [pt for pt, m in common.items() if m >= TILT_CONTACT_MIN_MARGIN]
+            if ok:
+                fixed = float(min(ok))
+                # 与逐点最陡相比损失多少：路径跨度大时固定倾角会被最远点拖平
+                per_point = [steepest_pitch(p, TILT_CONTACT_MIN_MARGIN) for p in points]
+                loss = fixed - float(np.mean([x for x in per_point if x is not None]))
+                if TILT_MODE == "fixed" or loss <= TILT_FIXED_MAX_LOSS:
+                    return TiltPlan("fixed", value=fixed), common[fixed]
+        else:
+            m, pt = max((m, pt) for pt, m in common.items())
+            if m >= TILT_FIXED_MIN_MARGIN or (TILT_MODE == "fixed" and m > JOINT_MARGIN_DEG):
+                return TiltPlan("fixed", value=float(pt)), m
         if TILT_MODE == "fixed":
             raise IKError("该木块路径不存在整段共同可达的固定倾角，请改用 auto/radial 或调整工位")
     m = min(best_margin(p, schedule.pitch(p)) for p in points)
@@ -505,7 +573,9 @@ def build_plan(task, only=None):
             dense += [a + t * (b - a) for t in np.linspace(0, 1, 8)]
         tilt, m = choose_tilt(np.array(dense), schedule)
         info[k]["tilt"], info[k]["tilt_margin"] = tilt, m
-        info[k]["hover_pitch"] = point_pitch(info[k]["hover"], schedule)
+        # 悬停与下降段：倾角尽量等于接触倾角，不可行处取最近的可行值
+        info[k]["approach_tilt"] = TiltPlan("nearest", value=tilt.pitch(info[k]["pre_touch"]))
+        info[k]["hover_pitch"] = info[k]["approach_tilt"].pitch(info[k]["hover"])
 
     ready_p = fig_to_base((0.0, 0.0), top + READY_HEIGHT)
     q_zero = np.zeros(5)
@@ -528,9 +598,8 @@ def build_plan(task, only=None):
         tilt = b["tilt"]
         q_hover = solve_ik(b["hover"], b["hover_pitch"], q_cur)
         segs.append(movej(f"{k}/to_hover", q_cur, q_hover, block=k))
-        seg = movel(f"{k}/descend", "descend", b["hover"], b["pre_touch"], tilt, q_hover,
-                    DESCEND_SPEED, k, in_contact=False,
-                    blend=(b["hover_pitch"], tilt.pitch(b["pre_touch"])))
+        seg = movel(f"{k}/descend", "descend", b["hover"], b["pre_touch"], b["approach_tilt"],
+                    q_hover, DESCEND_SPEED, k, in_contact=False)
         segs.append(seg)
         seg = movel(f"{k}/press", "press", b["pre_touch"], b["route_base"][0], tilt,
                     seg.q[-1, :5], PRESS_SPEED, k, in_contact=True)
