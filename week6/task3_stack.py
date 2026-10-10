@@ -431,6 +431,17 @@ def line_points(p0, p1, pitch0, pitch1, q_start, duration):
     return np.array(qs), pts, pitches
 
 
+def const_pitch_top(p_low, pitch, z_max, step=2.0, margin=JOINT_MARGIN_DEG + 1.0):
+    """从 p_low 起以固定俯仰竖直向上，最高能到多少（不超过 z_max）。"""
+    p = np.asarray(p_low, float)
+    z = p[2]
+    while z + step <= z_max + 1e-9 and best_margin((p[0], p[1], z + step), pitch) >= margin:
+        z += step
+    if z_max - z < step and best_margin((p[0], p[1], z_max), pitch) >= margin:
+        z = z_max
+    return float(z)
+
+
 def line_feasible(p0, p1, pitch0, pitch1, n=7, margin=JOINT_MARGIN_DEG + 1.0):
     return all(best_margin(p0 + t * (p1 - p0), (1 - t) * pitch0 + t * pitch1) >= margin
                for t in np.linspace(0.0, 1.0, n))
@@ -527,23 +538,32 @@ class Planner:
         return top + TRANSIT_CLEAR_EMPTY + FINGER_TIP + FINGER_HALF_W
 
     def travel_to_hover(self, label, hover, hover_pitch, target):
-        """竖直升到越障高度 → 高处横移 → 竖直降到目标上方（俯仰在高处过渡）。"""
-        zt = max(self.transit_z(), hover[2], grip_point(self.q)[2])
+        """竖直上升 → 高处横移 → 竖直下降到目标上方。
+
+        上升和下降都分两段：贴近木块/塔的一段姿态不变、纯竖直平动（夹爪不转动），
+        尽量拉长到该俯仰可达范围的上沿；俯仰变化只发生在其上方远离物体处
+        （此时夹取点仍沿竖直线运动）和高处横移中。
+        """
         here = grip_point(self.q)
+        zt = max(self.transit_z(), hover[2], here[2])
+        pitch_here = tool_pitch(self.q)
+        z_up_c = const_pitch_top(here, pitch_here, zt)       # 上升：姿态不变段的顶端
+        z_dn_c = const_pitch_top(hover, hover_pitch, zt)     # 下降：姿态不变段的顶端
+        up_c = np.array([here[0], here[1], z_up_c])
         up = np.array([here[0], here[1], zt])
         above = np.array([hover[0], hover[1], zt])
-        pitch_here = tool_pitch(self.q)
-        # 选择越障高度上的两个俯仰，使三段直线（含俯仰线性过渡）都可行
+        dn_c = np.array([hover[0], hover[1], z_dn_c])
+        # 选择越障高度上的两个俯仰，使转角段与横移段（含俯仰线性过渡）都可行
         cand_a = sorted(PITCH_GRID, key=lambda x: abs(x - pitch_here))
         cand_b = sorted(PITCH_GRID, key=lambda x: abs(x - hover_pitch))
         cand_a = [x for x in cand_a if best_margin(up, x) >= JOINT_MARGIN_DEG + 1][:40]
         cand_b = [x for x in cand_b if best_margin(above, x) >= JOINT_MARGIN_DEG + 1][:40]
         choice = None
         for a in cand_a:
-            if not line_feasible(here, up, pitch_here, a):
+            if not line_feasible(up_c, up, pitch_here, a):
                 continue
             for b in cand_b:
-                if line_feasible(up, above, a, b, n=9) and line_feasible(above, hover, b, hover_pitch):
+                if line_feasible(up, above, a, b, n=9) and line_feasible(above, dn_c, b, hover_pitch):
                     choice = (a, b)
                     break
             if choice:
@@ -551,11 +571,15 @@ class Planner:
         if choice is None:
             raise IKError(f"{label}: 找不到可行的越障路线（越障高度 {zt:.0f} mm）")
         a, b = choice
-        if zt - here[2] > 0.5 or abs(a - pitch_here) > 0.1:
-            self.line(f"{label}/上升", up, a, VERTICAL_SPEED, target=self.under)
+        if z_up_c - here[2] > 0.5:
+            self.line(f"{label}/竖直上升", up_c, pitch_here, VERTICAL_SPEED, target=self.under)
+        if zt - z_up_c > 0.5 or abs(a - pitch_here) > 0.1:
+            self.line(f"{label}/上升转角", up, a, VERTICAL_SPEED, target=self.under)
         self.line(f"{label}/横移", above, b, TRANSIT_SPEED)
-        if zt - hover[2] > 0.5 or abs(b - hover_pitch) > 0.1:
-            self.line(f"{label}/下降", hover, hover_pitch, VERTICAL_SPEED, target=target)
+        if zt - z_dn_c > 0.5 or abs(b - hover_pitch) > 0.1:
+            self.line(f"{label}/下降转角", dn_c, hover_pitch, VERTICAL_SPEED, target=target)
+        if z_dn_c - hover[2] > 0.5:
+            self.line(f"{label}/竖直下降", hover, hover_pitch, VERTICAL_SPEED, target=target)
         self.under = target          # 已离开原来那块，下方变为新的目标（可能为空）
 
     def pick(self, name, center, yaw, pitch, label, travel=True):
@@ -610,11 +634,16 @@ class Planner:
         zt = max(self.transit_z(), here[2])
         if zt - here[2] > 0.5:
             pt = tool_pitch(self.q)
-            for a in sorted(PITCH_GRID, key=lambda x: abs(x - pt)):
-                if line_feasible(here, np.array([here[0], here[1], zt]), pt, a):
-                    self.line(f"{label}/上升", np.array([here[0], here[1], zt]), a, VERTICAL_SPEED,
-                              target=self.under)
-                    break
+            z_c = const_pitch_top(here, pt, zt)
+            up_c = np.array([here[0], here[1], z_c])
+            if z_c - here[2] > 0.5:
+                self.line(f"{label}/竖直上升", up_c, pt, VERTICAL_SPEED, target=self.under)
+            if zt - z_c > 0.5:
+                for a in sorted(PITCH_GRID, key=lambda x: abs(x - pt)):
+                    if line_feasible(up_c, np.array([here[0], here[1], zt]), pt, a):
+                        self.line(f"{label}/上升转角", np.array([here[0], here[1], zt]), a,
+                                  VERTICAL_SPEED, target=self.under)
+                        break
         self.movej(f"{label}/回零", np.zeros(5), duration=3.0)
 
     def start_from_zero(self, first_hover, pitch):
@@ -883,6 +912,22 @@ def check_plan(pl, stride=2, raise_on_fail=True):
 # 9. 摘要、导出与可视化
 # ============================================================
 
+def straight_descent_stats(pl):
+    """每次夹紧/松开之前，夹爪姿态不变、纯竖直下降的连续长度（mm）。"""
+    out, run = {}, 0.0
+    for seg in pl.segments:
+        if seg.kind == "line":
+            p0, p1 = grip_point(seg.q[0]), grip_point(seg.q[-1])
+            vertical = np.linalg.norm(p1[:2] - p0[:2]) < 0.05 and p1[2] < p0[2]
+            const = abs(tool_pitch(seg.q[0]) - tool_pitch(seg.q[-1])) < 0.05
+            run = run + (p0[2] - p1[2]) if (vertical and const) else 0.0
+        elif seg.kind == "grip":
+            out[seg.label] = run
+        elif seg.kind not in ("dwell", "wait"):
+            run = 0.0
+    return out
+
+
 def summarize(pl):
     L = [f"\n========== 叠塔 {pl.layers} 层 + 拆塔 =========="]
     L.append(f"塔位 {TOWER_XY} mm（r={np.hypot(*TOWER_XY):.0f}），桌面 z={TABLE_Z}，木块 {BLOCK_SIZE} mm")
@@ -905,6 +950,10 @@ def summarize(pl):
     L.append(f"夹指最低点高出被夹木块底面至少 {c['min_finger_margin']:.1f} mm；"
              f"手中木块离桌面最低 {c['min_held_clear']:.1f} mm；"
              f"与其他木块最小间隙 {c.get('min_held_gap', float('nan')):.1f} mm（0 为起吊/落下时贴合）")
+    sd = straight_descent_stats(pl)
+    if sd:
+        L.append(f"夹紧/松开前姿态不变的纯竖直下降：最短 {min(sd.values()):.0f} mm，"
+                 f"平均 {np.mean(list(sd.values())):.0f} mm（夹爪在此段不转动）")
     if c["pitch_mismatch"]:
         worst = max(abs(v) for v in c["pitch_mismatch"].values())
         L.append(f"夹取/放下俯仰最大差 {worst:.3f}°（木块保持水平）")

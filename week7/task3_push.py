@@ -115,6 +115,7 @@ LIFT_MIN_CLEAR = 5.0      # 抬离后接触点至少高出块顶
 TILT_MODE = "auto"          # auto：能固定就固定，否则按半径排程；或 "fixed"/"radial"
 TILT_FIXED_MIN_MARGIN = 6.0  # 固定倾角整段的最小关节余量要求（deg）
 TILT_SEARCH_DEG = np.arange(-85.0, -15.0, 1.0)
+CONST_DESCENT_MARGIN = 5.0     # 下降段“倾角不变纯竖直”部分要求的关节余量（宁短勿贴限位）
 
 # 净空检查
 ARM_RADIUS = 15.0         # 连杆/夹爪主体包络半径
@@ -291,6 +292,27 @@ def fit_tilt_schedule(z_contact):
         raise IKError("可达点过少，无法建立倾角排程")
     coef, *_ = np.linalg.lstsq(np.array(rows), np.array(pitches), rcond=None)
     return TiltPlan("radial", coef=tuple(float(c) for c in coef))
+
+
+def const_pitch_top(p_low, pitch, z_max, step=2.0, margin=JOINT_MARGIN_DEG + 1.0):
+    """从 p_low 起以固定倾角竖直向上，最高能到多少（不超过 z_max）。"""
+    p = np.asarray(p_low, float)
+    z = p[2]
+    while z + step <= z_max + 1e-9 and best_margin((p[0], p[1], z + step), pitch) >= margin:
+        z += step
+    if z_max - z < step and best_margin((p[0], p[1], z_max), pitch) >= margin:
+        z = z_max
+    return float(z)
+
+
+def blend_start_pitch(top, bottom, pitch_bottom, margin=JOINT_MARGIN_DEG + 1.0):
+    """悬停点倾角：尽量接近 pitch_bottom，且 top→bottom 倾角线性过渡全程可行。"""
+    top, bottom = np.asarray(top, float), np.asarray(bottom, float)
+    for pt in sorted(np.arange(-85.0, -15.0, 0.5), key=lambda x: abs(x - pitch_bottom)):
+        if all(best_margin(top + t * (bottom - top), (1 - t) * pt + t * pitch_bottom) >= margin
+               for t in np.linspace(0.0, 1.0, 9)):
+            return float(pt)
+    raise IKError(f"悬停点 {np.round(top, 1)} 下降过程找不到连续可行的倾角过渡")
 
 
 def point_pitch(p, schedule, min_margin=TILT_FIXED_MIN_MARGIN):
@@ -511,7 +533,15 @@ def build_plan(task, only=None):
             dense += [a + t * (b - a) for t in np.linspace(0, 1, 8)]
         tilt, m = choose_tilt(np.array(dense), schedule)
         info[k]["tilt"], info[k]["tilt_margin"] = tilt, m
-        info[k]["hover_pitch"] = point_pitch(info[k]["hover"], schedule)
+        # 下降段分两段：贴近木块的一段保持接触倾角、纯竖直平动（夹爪不转动），
+        # 尽量拉长；倾角变化只在其上方进行（夹爪末端仍沿竖直线）。
+        pc = tilt.pitch(info[k]["pre_touch"])
+        pre = info[k]["pre_touch"]
+        z_c = const_pitch_top(pre, pc, info[k]["hover"][2], margin=CONST_DESCENT_MARGIN)
+        info[k]["descend_mid"] = np.array([pre[0], pre[1], z_c])
+        info[k]["hover_pitch"] = (pc if info[k]["hover"][2] - z_c < 0.5
+                                  else blend_start_pitch(info[k]["hover"], info[k]["descend_mid"], pc,
+                                                         margin=CONST_DESCENT_MARGIN))
 
     ready_p = fig_to_base((0.0, 0.0), top + READY_HEIGHT)
     q_zero = np.zeros(5)
@@ -534,9 +564,15 @@ def build_plan(task, only=None):
         tilt = b["tilt"]
         q_hover = solve_ik(b["hover"], b["hover_pitch"], q_cur)
         segs.append(movej(f"{k}/to_hover", q_cur, q_hover, block=k))
-        seg = movel(f"{k}/descend", "descend", b["hover"], b["pre_touch"], tilt, q_hover,
-                    DESCEND_SPEED, k, in_contact=False,
-                    blend=(b["hover_pitch"], tilt.pitch(b["pre_touch"])))
+        pc = tilt.pitch(b["pre_touch"])
+        seg = None
+        if b["hover"][2] - b["descend_mid"][2] > 0.5:
+            seg = movel(f"{k}/descend_turn", "descend", b["hover"], b["descend_mid"], tilt, q_hover,
+                        DESCEND_SPEED, k, in_contact=False, blend=(b["hover_pitch"], pc))
+            segs.append(seg)
+        seg = movel(f"{k}/descend", "descend", b["descend_mid"], b["pre_touch"], tilt,
+                    seg.q[-1, :5] if seg is not None else q_hover,
+                    DESCEND_SPEED, k, in_contact=False, blend=(pc, pc))
         segs.append(seg)
         seg = movel(f"{k}/press", "press", b["pre_touch"], b["route_base"][0], tilt,
                     seg.q[-1, :5], PRESS_SPEED, k, in_contact=True)
