@@ -20,6 +20,54 @@ import matplotlib.pyplot as plt
 # 模型角到控制侧角、控制侧角到舵机角各乘一次 -1，最终发送角与模型角一致。
 SERVO_DIRECTION_MAP = np.full(6, -1.0)
 
+# 实机确认的关节指令范围（与 teleop/position_ik.py、week6 一致），单位 deg。
+JOINT_LIMITS_DEG = np.array(
+    [
+        [-90.0, 90.0],    # J1 底座偏航
+        [-90.0, 90.0],    # J2 大臂俯仰
+        [-90.0, 90.0],    # J3 小臂俯仰
+        [-90.0, 25.0],    # J4 腕部俯仰
+        [-180.0, 180.0],  # J5 腕部横滚（锁零）
+    ]
+)
+
+# 基坐标系中的桌面高度（week6 实机标定值），用于检查连杆是否扫到桌面。
+TABLE_Z = 52.0
+TABLE_CLEARANCE = 5.0
+
+# 逆解种子：指导书要求的“肘部向上预弯曲构型”。Target A 在关节限位内
+# 只存在 J2>0、肘部折叠的一族解；若用 q_prepare 作种子，LM 会收敛到
+# J2≈-122°、J4≈+96° 的越限解。
+Q_IK_SEED_DEG = [0.0, 45.0, -80.0, -80.0, 0.0]
+
+
+def check_joint_limits(q_trajectory, label="轨迹"):
+    """逐帧检查五轴角度是否落在实机限位内，越限则拒绝下发。"""
+    q_deg = np.rad2deg(np.atleast_2d(q_trajectory))
+    low = q_deg < JOINT_LIMITS_DEG[:, 0] - 1e-6
+    high = q_deg > JOINT_LIMITS_DEG[:, 1] + 1e-6
+    if np.any(low | high):
+        frame, joint = np.argwhere(low | high)[0]
+        raise RuntimeError(
+            f"{label}第 {frame + 1} 帧 J{joint + 1}={q_deg[frame, joint]:.2f}° "
+            f"超出限位 {JOINT_LIMITS_DEG[joint].tolist()}，已拒绝下发。"
+        )
+
+
+def check_table_clearance(robot, q_trajectory):
+    """检查各关节坐标原点与末端是否始终高于桌面。返回最低点高度。"""
+    lowest = min(
+        frame.t[2]
+        for q in q_trajectory
+        for frame in robot.fkine_all(q)[2:]
+    )
+    if lowest < TABLE_Z + TABLE_CLEARANCE:
+        raise RuntimeError(
+            f"连杆最低点 z={lowest:.1f} mm 低于桌面安全高度 "
+            f"{TABLE_Z + TABLE_CLEARANCE:.1f} mm。"
+        )
+    return lowest
+
 
 def pack_frame(q_rad):
     """将 6 个关节弧度值打包为 STM32 使用的 16 字节控制帧。"""
@@ -172,7 +220,7 @@ def run_movej_experiment(show_animation=True, mode="auto", port="COM3"):
     target_pose = sm.SE3(*target_a)
     ik_solution = robot.ikine_LM(
         target_pose,
-        q0=q_prepare,
+        q0=np.deg2rad(Q_IK_SEED_DEG),
         mask=[1, 1, 1, 0, 0, 0],
     )
     if not ik_solution.success:
@@ -180,6 +228,8 @@ def run_movej_experiment(show_animation=True, mode="auto", port="COM3"):
         raise RuntimeError(f"Target A 逆运动学求解失败：{reason}")
 
     q_target = np.asarray(ik_solution.q, dtype=np.float64)
+    q_target[4] = 0.0  # 第 5 轴不影响末端位置，锁零。
+    check_joint_limits(q_target, label="Target A 逆解")
     reached_point = robot.fkine(q_target).t
     position_error = np.linalg.norm(reached_point - target_a)
 
@@ -196,6 +246,18 @@ def run_movej_experiment(show_animation=True, mode="auto", port="COM3"):
     complete_trajectory = np.vstack(
         [traj_prepare, traj_target[1:], traj_return[1:]]
     )
+    check_joint_limits(complete_trajectory, label="完整轨迹")
+    lowest_z = check_table_clearance(robot, complete_trajectory)
+    print(f"整条轨迹连杆最低点：{lowest_z:.1f} mm（桌面 {TABLE_Z:.1f} mm）")
+
+    # 按指导书顺序：先完成规划与仿真，再连接串口并下发全零目标。
+    if show_animation:
+        animate_robot_motion(
+            robot,
+            complete_trajectory,
+            dt=0.04,
+            target_point=target_a,
+        )
 
     ser = None
     try:
@@ -203,14 +265,6 @@ def run_movej_experiment(show_animation=True, mode="auto", port="COM3"):
             ser = init_serial(port=port)
             if mode == "hardware" and ser is None:
                 raise RuntimeError(f"hardware 模式无法打开串口 {port}")
-
-        if show_animation:
-            animate_robot_motion(
-                robot,
-                complete_trajectory,
-                dt=0.04,
-                target_point=target_a,
-            )
 
         execute_joint_trajectory(ser, traj_prepare, duration=2.0)
         execute_joint_trajectory(ser, traj_target, duration=3.0)

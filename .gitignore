@@ -12,3 +12,6 @@ env/
 
 teleop/recordings/*
 !teleop/recordings/.gitignore
+
+# 推块实验离线规划导出
+week7/push_output/

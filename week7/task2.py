@@ -28,6 +28,32 @@ TOOL_LOWEST_POINT_OFFSET_Z = 0.0
 # 规划时要求夹爪最低点至少高出桌面 5 mm。
 TABLE_CLEARANCE = 5.0
 
+# 实机确认的关节指令范围（与 teleop/position_ik.py、week6 一致），单位 deg。
+JOINT_LIMITS_DEG = np.array(
+    [
+        [-90.0, 90.0],    # J1 底座偏航
+        [-90.0, 90.0],    # J2 大臂俯仰
+        [-90.0, 90.0],    # J3 小臂俯仰
+        [-90.0, 25.0],    # J4 腕部俯仰
+        [-180.0, 180.0],  # J5 腕部横滚（锁零）
+    ]
+)
+# 笛卡尔路径相邻两点允许的最大关节角变化；超过即认为逆解跳了分支。
+MAX_JOINT_STEP_DEG = 5.0
+
+
+def check_joint_limits(q_trajectory, label="轨迹"):
+    """逐帧检查五轴角度是否落在实机限位内，越限则拒绝下发。"""
+    q_deg = np.rad2deg(np.atleast_2d(q_trajectory))
+    low = q_deg < JOINT_LIMITS_DEG[:, 0] - 1e-6
+    high = q_deg > JOINT_LIMITS_DEG[:, 1] + 1e-6
+    if np.any(low | high):
+        frame, joint = np.argwhere(low | high)[0]
+        raise RuntimeError(
+            f"{label}第 {frame + 1} 帧 J{joint + 1}={q_deg[frame, joint]:.2f}° "
+            f"超出限位 {JOINT_LIMITS_DEG[joint].tolist()}，已拒绝下发。"
+        )
+
 
 def pack_frame(q_rad):
     """将 6 个关节弧度值打包为 STM32 使用的 16 字节控制帧。"""
@@ -361,7 +387,9 @@ def run_movel_experiment(show_animation=True, mode="auto", motion="movel", port=
 
     robot = build_robot_model(dh_params_servo)
     q_zero = np.zeros(5, dtype=np.float64)
-    q_seed = np.deg2rad([0.0, -45.0, -80.0, 80.0, 0.0])
+    # 指导书给定的种子。原先的 [0,-45,-80,80,0] 会让整条路径收敛到
+    # J3≈-96°、J4≈+145° 的越限分支（J4 实机上限 25°）。
+    q_seed = np.deg2rad([0.0, 45.0, -80.0, -80.0, 0.0])
     p_start = np.array([120.0, 0.0, 260.0], dtype=np.float64)
     p_via = np.array([160.0, 40.0, 260.0], dtype=np.float64)
     p_goal = (
@@ -387,10 +415,16 @@ def run_movel_experiment(show_animation=True, mode="auto", motion="movel", port=
     complete_trajectory = np.vstack([q_enter, q_path[1:], q_return[1:]])
 
     minimum_tool_z = validate_table_clearance(robot, complete_trajectory)
+    check_joint_limits(complete_trajectory, label="完整轨迹")
 
     actual_path = np.asarray([robot.fkine(q).t for q in q_path])
     point_errors = np.linalg.norm(actual_path - cartesian_points, axis=1)
     max_joint_step = np.max(np.abs(np.diff(np.rad2deg(q_path), axis=0)))
+    if max_joint_step > MAX_JOINT_STEP_DEG:
+        raise RuntimeError(
+            f"笛卡尔路径相邻关节角最大变化 {max_joint_step:.2f}° 超过 "
+            f"{MAX_JOINT_STEP_DEG:.1f}°，逆解可能跳分支，已拒绝下发。"
+        )
 
     print(f"\n========== 第七周实验 1.3：{motion.upper()} ==========")
     print(f"路径起点：{p_start} mm")
