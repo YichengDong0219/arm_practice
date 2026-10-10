@@ -15,3 +15,6 @@ teleop/recordings/*
 
 # 推块实验离线规划导出
 week7/push_output/
+
+# 叠塔实验离线规划导出
+week6/stack_output/
