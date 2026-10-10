@@ -80,11 +80,11 @@ SEND_PERIOD_S = 0.02   # 50 Hz 流式下发，与 teleop 一致
 
 TABLE_Z = 52.0          # 桌面在基座坐标系中的高度（week6 实机标定）
 BLOCK_SIZE = 30.0       # h：按实物测量边长后修改
-GAP = 3.0               # g：内围相邻块名义间隙（理论 0，实机建议 2~3 mm）
-LANE_MARGIN = 5.0       # m：绕行通道与已到位木块的额外间距
+GAP = 6.0               # g：内围相邻块名义间隙（理论 0；取 6 mm 留出放置误差，避免相撞）
+LANE_MARGIN = 8.0       # m：绕行通道与已到位木块的额外间距
 
 WORK_CENTER_XY = (230.0, 0.0)  # 方阵中心 (x_c, y_c)，见 --mode scan
-OUTER_OFFSET = 60.0            # D：外围块中心相对方阵中心的 u、v 偏距
+OUTER_OFFSET = 62.0            # D：外围块中心相对方阵中心的 u、v 偏距（须 ≥ h + s + m + g，见 min_outer_offset）
 WORK_YAW_DEG = 0.0             # 工作坐标系绕中心旋转角
 
 # 接触与补偿
@@ -123,7 +123,7 @@ BLOCK_CLEARANCE = 5.0     # 连杆包络高出木块顶面的最小距离
 TIP_CLEARANCE = 2.0       # 夹指尖端包络高出非当前木块顶面的最小距离
 TABLE_CLEARANCE = 3.0     # 连杆包络高出桌面的最小距离
 TIP_EXCLUDE = 25.0        # 距接触点该链长以内视为夹指尖端；接触段内对当前木块豁免
-SWEEP_MIN_GAP = 1.0       # 被拖木块与其他木块的最小间隙
+SWEEP_MIN_GAP = 3.0       # 被拖木块与其他木块的最小间隙
 MAX_FK_ERROR = 0.5        # 笛卡尔段接触点正解误差上限（mm）
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "push_output"
@@ -340,6 +340,12 @@ def base_to_fig(xy):
     R = np.array([[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]])
     local = R.T @ (np.asarray(xy[:2]) - np.asarray(WORK_CENTER_XY))
     return np.array([-local[1], local[0]])
+
+
+def min_outer_offset():
+    """选做二中 c 的右侧通道、b 的转向点与外围 d 保持至少 g 的间隙所需的最小 D。"""
+    s = (BLOCK_SIZE + GAP) / 2.0
+    return BLOCK_SIZE + s + LANE_MARGIN + GAP
 
 
 def task_layout(task):
@@ -1022,7 +1028,7 @@ def run_scan():
 # ============================================================
 
 def main():
-    global WORK_CENTER_XY, OUTER_OFFSET, GAP, PRESS_DEPTH
+    global WORK_CENTER_XY, OUTER_OFFSET, GAP, PRESS_DEPTH, LANE_MARGIN
     ap = argparse.ArgumentParser(description="第七周附加实验：桌面推块")
     ap.add_argument("--mode", choices=("plan", "simulate", "hardware", "calib", "scan"), default="plan")
     ap.add_argument("--task", type=int, choices=(1, 2, 3), default=1)
@@ -1030,6 +1036,7 @@ def main():
     ap.add_argument("--center", type=float, nargs=2, metavar=("X", "Y"), help="方阵中心（基座系 mm）")
     ap.add_argument("--outer", type=float, help="外围偏距 D（mm）")
     ap.add_argument("--gap", type=float, help="内围名义间隙 g（mm）")
+    ap.add_argument("--lane", type=float, help="绕行通道额外间距 m（mm）")
     ap.add_argument("--press", type=float, help="下压量 δ（mm）")
     ap.add_argument("--calib-block", choices=BLOCK_NAMES, default="a")
     ap.add_argument("--step", action="store_true", help="实机每块下降前回车确认（调试用）")
@@ -1043,10 +1050,15 @@ def main():
         WORK_CENTER_XY = tuple(args.center)
     if args.outer:
         OUTER_OFFSET = args.outer
+    if args.lane is not None:
+        LANE_MARGIN = args.lane
     if args.gap is not None:
         GAP = args.gap
     if args.press is not None:
         PRESS_DEPTH = args.press
+    if OUTER_OFFSET < min_outer_offset() - 1e-6:
+        print(f"提示：外围偏距 D={OUTER_OFFSET:.1f} mm 小于 {min_outer_offset():.1f} mm，"
+              "选做二中绕行木块会贴近外围 d；建议用 --outer 加大。")
 
     if args.mode == "scan":
         run_scan()
