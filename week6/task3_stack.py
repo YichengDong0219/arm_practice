@@ -13,9 +13,13 @@ week6/task3_new.py 用“近水平夹爪”（J2+J3+J4≈-90°±10°）抓取。
    两指沿侧向张合，夹住木块两个侧面；绕侧向轴俯仰不改变指面与侧面的贴合。
 2. 俯仰一致：同一块木块从夹起到放下，夹爪俯仰必须相同，否则木块在手中被
    转歪、放到塔上会倾斜。受 J3/J4 限位约束，每层在塔位只有一个窄俯仰窗口，
-   因此程序为每层计算一个“供料位”（离基座的半径不同），使供料位与该层塔位
-   的俯仰窗口重叠。所有木块开机前一次摆好，叠塔与拆塔全自动，运动中无人
-   伸手进入工作区。
+   因此程序为每层计算一个取料点，使它与该层塔位的俯仰窗口重叠。两种供料方式：
+   - 人工递料（--feed hand，默认，可到 8 层）：每层一个“垫块高度 + 水平位置”的
+     递料点。机械臂张爪停在递料点上方后静止等待，人把垫块和木块放到两指正下方，
+     撤手回车，机械臂再下降夹取；拆塔时反过来。垫块定住木块高度（手持悬空会让
+     夹持高度有几毫米随机误差，放到高塔上会压塔或掉落），水平位置随夹爪摆放。
+     高层需要更平的俯仰，桌面上够不着，所以 L4、L6~L8 用 30~120 mm 垫块。
+   - 桌面预摆（--feed table，≤5 层）：所有木块开机前摆好，叠塔与拆塔全自动。
 3. 只在高处横移：在塔和供料位附近只做竖直进出；横移在“越障高度”进行，
    高于当前塔顶与所有木块。横移途中俯仰可以变化（木块暂时倾斜），落下前
    恢复到夹取时的俯仰。
@@ -27,8 +31,9 @@ week6/task3_new.py 用“近水平夹爪”（J2+J3+J4≈-90°±10°）抓取。
 
 运行方式（先离线，后实机）::
 
-    python week6/task3_stack.py --mode scan                      # 各层俯仰窗口与可叠层数
-    python week6/task3_stack.py --mode plan --layers 3           # 规划+检查，导出 CSV/JSON/PNG
+    python week6/task3_stack.py --mode scan                      # 各层俯仰窗口、递料点与可叠层数
+    python week6/task3_stack.py --mode plan --layers 8           # 规划+检查，打印每层递料点和垫块高度
+    python week6/task3_stack.py --mode plan --layers 3 --feed table   # 桌面预摆、全自动
     python week6/task3_stack.py --mode simulate --layers 3       # 三维动画（木块随夹爪移动）
     python week6/task3_stack.py --mode calib --port COM5         # 实机：张爪停在 L1 供料块处供核对
     python week6/task3_stack.py --mode hardware --layers 3 --port COM5 [--phase stack|unstack|both] [--step]
@@ -97,7 +102,18 @@ BLOCK_SIZE = 30.0                # h
 TOWER_XY = (200.0, -45.0)        # 塔位（r≈205 mm，俯仰窗口比 r≈184 宽 2~5 倍）
 SUPPLY_AZIMUTHS_DEG = (30.0, 52.0)   # 供料位所在方位（远离塔，交替使用避免互相重叠）
 SUPPLY_SPACING = 12.0            # 相邻供料块之间的最小间隙
-MAX_LAYERS = 5
+MAX_LAYERS = 8
+
+# 供料方式：
+#   "hand"  人工递料（默认）：每层一个递料点（垫块高度 + 水平位置），机械臂张爪停在
+#           递料点上方，人把“垫块+木块”放到两指正下方，撤手回车后机械臂下降夹取。
+#           垫块定住木块高度，水平位置随夹爪摆放，因此 7~8 层也能匹配俯仰。
+#   "table" 预摆供料：所有木块开机前摆在桌面供料位，全自动（最多约 5 层）。
+FEED_MODE = "hand"
+FEED_SUPPORT_HEIGHTS = (0.0, 30.0, 60.0, 90.0, 120.0)   # 可用垫块高度（0=直接放桌面）
+FEED_AZIMUTH_DEG = 40.0          # 递料点所在方位（远离塔，人手不必靠近塔）
+FEED_RADIUS_RANGE = (180.0, 320.0)
+FEED_MIN_OVERLAP = 3.0           # 递料点与塔位俯仰窗口的最小重叠（deg）
 
 # 竖直进出与放置
 APPROACH = 12.0                  # 在供料位/塔位上方以夹取俯仰竖直进出的距离
@@ -136,7 +152,7 @@ HELD_CLEARANCE = 0.5             # 持块与其他木块/桌面的最小间隙�
 MAX_FK_ERROR = 0.5
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "stack_output"
-PITCH_GRID = np.arange(-85.0, -5.0, 0.5)
+PITCH_GRID = np.arange(-85.0, 20.0, 0.5)   # 高塔越障时需要接近水平甚至略上仰
 
 
 # ============================================================
@@ -320,6 +336,57 @@ def plan_supply(layers):
     return supply
 
 
+def plan_feed(layers):
+    """人工递料：为每层选“垫块高度 + 半径”，使递料点俯仰窗口覆盖该层塔位窗口。
+
+    在重叠宽度、垫块高度、手臂伸展程度之间折中（见评分）。
+    递料点之间不会同时存在，因此都放在同一方位 FEED_AZIMUTH_DEG 上。
+    """
+    if layers > MAX_LAYERS:
+        raise IKError(f"层数 {layers} 超过设计上限 {MAX_LAYERS}")
+    az = np.deg2rad(FEED_AZIMUTH_DEG)
+    cache = {}
+
+    def feed_window(H, r):
+        if (H, r) not in cache:
+            z = TABLE_Z + H + BLOCK_SIZE / 2 + GRASP_Z_OFFSET
+            p0 = np.array([r, 0.0, z])
+            cache[(H, r)] = pitch_window(p0, p0 + np.array([0, 0, APPROACH + RELEASE_GAP]))
+        return cache[(H, r)]
+
+    feed = {}
+    for k in range(1, layers + 1):
+        g = grasp_point_from_center(layer_center(k), k) + np.array([0, 0, RELEASE_GAP])
+        W = pitch_window(g, g + np.array([0, 0, APPROACH]))
+        if W is None:
+            raise IKError(f"第 {k} 层塔位在任何俯仰下都不可达")
+        best = None
+        for need in (FEED_MIN_OVERLAP, 1.0):
+            for H in sorted(FEED_SUPPORT_HEIGHTS):
+                for r in np.arange(FEED_RADIUS_RANGE[0], FEED_RADIUS_RANGE[1] + 0.1, 4.0):
+                    S = feed_window(H, r)
+                    if S is None:
+                        continue
+                    lo, hi = max(W[0], S[0]), min(W[1], S[1])
+                    if hi - lo < need:
+                        continue
+                    # 重叠越宽越好（离限位越远）；垫块越低越稳；半径靠近 250 mm
+                    # 时手臂不过分伸展、下垂小。三者折中，宁可多垫一块也不贴着臂展边缘。
+                    score = (hi - lo) - 0.03 * H - 0.05 * abs(r - 250.0)
+                    if best is None or score > best[0]:
+                        best = (score, H, r, (lo, hi), S)
+            if best:
+                break
+        if best is None:
+            raise IKError(f"第 {k} 层找不到俯仰匹配的递料点（塔位窗口 {W}）；可增加更高的垫块")
+        _, H, r, ov, S = best
+        center = np.array([r * np.cos(az), r * np.sin(az), TABLE_Z + H + BLOCK_SIZE / 2])
+        feed[k] = {"center": center, "yaw": float(az), "pitch": float((ov[0] + ov[1]) / 2),
+                   "overlap": ov, "tower_window": W, "supply_window": S, "azimuth": FEED_AZIMUTH_DEG,
+                   "support": float(H)}
+    return feed
+
+
 # ============================================================
 # 6. 轨迹段
 # ============================================================
@@ -327,7 +394,7 @@ def plan_supply(layers):
 @dataclass
 class Segment:
     label: str
-    kind: str                 # movej / line / grip / dwell
+    kind: str                 # movej / line / grip / dwell / wait
     q: np.ndarray             # N x 6 指令角（deg）
     duration: float
     ref: np.ndarray | None = None
@@ -336,6 +403,7 @@ class Segment:
     target: str | None = None  # 正在夹取/放置的木块名（允许夹指靠近）
     scene: dict = field(default_factory=dict)  # 本段内静止木块：名 → (中心, 偏航)
     phase: str = ""
+    message: str = ""         # wait 段提示人工操作的内容
 
 
 def quintic(n):
@@ -373,16 +441,18 @@ def line_feasible(p0, p1, pitch0, pitch1, n=7, margin=JOINT_MARGIN_DEG + 1.0):
 # ============================================================
 
 class Planner:
-    def __init__(self, layers):
+    def __init__(self, layers, feed_mode=None):
         self.layers = layers
-        self.supply = plan_supply(layers)
+        self.feed_mode = feed_mode or FEED_MODE
+        self.supply = plan_feed(layers) if self.feed_mode == "hand" else plan_supply(layers)
         self.segments: list[Segment] = []
         self.q = np.zeros(5)
         self.grip = GRIP_OPEN_DEG
         self.held = None
         self.held_rel = {}           # 木块 → 相对夹爪的位姿（4x4）
-        self.blocks = {f"L{k}": (self.supply[k]["center"].copy(), self.supply[k]["yaw"])
-                       for k in range(1, layers + 1)}
+        # 预摆模式下所有木块开机就在供料位；递料模式下木块递到夹爪下才出现
+        self.blocks = {} if self.feed_mode == "hand" else {
+            f"L{k}": (self.supply[k]["center"].copy(), self.supply[k]["yaw"]) for k in range(1, layers + 1)}
         self.tower: list[str] = []
         self.phase = ""
         self.under = None            # 夹指正下方/之间的木块（刚夹起或刚放下的那块）
@@ -443,6 +513,12 @@ class Planner:
         q = add_grip_col(np.repeat(self.q[None, :], n, axis=0), self.grip)
         self._push(Segment(label, "dwell", q, seconds, target=target))
 
+    def wait(self, label, message):
+        """静止等待人工操作（递料/取料）；规划与仿真中不占时间，实机执行时回车继续。"""
+        q = add_grip_col(np.repeat(self.q[None, :], 2, axis=0), self.grip)
+        # 静止时夹指可能仍跨在刚放下/待夹取的木块两侧（之后只做竖直运动）
+        self._push(Segment(label, "wait", q, 0.0, message=message, target=self.under))
+
     # ---------- 组合动作 ----------
     def transit_z(self):
         top = self.top_of_obstacles()
@@ -480,12 +556,14 @@ class Planner:
         self.line(f"{label}/横移", above, b, TRANSIT_SPEED)
         if zt - hover[2] > 0.5 or abs(b - hover_pitch) > 0.1:
             self.line(f"{label}/下降", hover, hover_pitch, VERTICAL_SPEED, target=target)
+        self.under = target          # 已离开原来那块，下方变为新的目标（可能为空）
 
-    def pick(self, name, center, yaw, pitch, label):
-        """张爪竖直下降 → 静置 → 慢合 → 静置 → 慢起。"""
+    def pick(self, name, center, yaw, pitch, label, travel=True):
+        """张爪竖直下降 → 静置 → 慢合 → 静置 → 慢起。travel=False 表示已在夹取点上方。"""
         g = grasp_point_from_center(center)
         hover = g + np.array([0, 0, APPROACH])
-        self.travel_to_hover(f"{label}/去夹取", hover, pitch, target=name)
+        if travel:
+            self.travel_to_hover(f"{label}/去夹取", hover, pitch, target=name)
         self.vertical(f"{label}/下降", g[2] + SLOW_ZONE, VERTICAL_SPEED, target=name)
         self.vertical(f"{label}/慢降", g[2], SLOW_SPEED, target=name)
         self.dwell(f"{label}/静置", SETTLE_S, target=name)
@@ -503,11 +581,15 @@ class Planner:
         self.vertical(f"{label}/抬起", g[2] + APPROACH + sag, VERTICAL_SPEED, target=name)
         self.under = name
 
-    def place(self, name, center, pitch, label, k_layer=None):
-        """竖直下降到“底面高出支撑面 RELEASE_GAP” → 静置 → 慢开 → 静置 → 慢起。"""
+    def place_hover(self, center, k_layer=None):
         g = grasp_point_from_center(center, k_layer) + np.array([0, 0, RELEASE_GAP + HOLD_SAG_COMP])
-        hover = g + np.array([0, 0, APPROACH])
-        self.travel_to_hover(f"{label}/去放置", hover, pitch, target=name)
+        return g, g + np.array([0, 0, APPROACH])
+
+    def place(self, name, center, pitch, label, k_layer=None, travel=True):
+        """竖直下降到“底面高出支撑面 RELEASE_GAP” → 静置 → 慢开 → 静置 → 慢起。"""
+        g, hover = self.place_hover(center, k_layer)
+        if travel:
+            self.travel_to_hover(f"{label}/去放置", hover, pitch, target=name)
         self.vertical(f"{label}/下降", g[2] + SLOW_ZONE, VERTICAL_SPEED, target=name)
         self.vertical(f"{label}/慢降", g[2], SLOW_SPEED, target=name)
         self.dwell(f"{label}/静置", SETTLE_S, target=name)
@@ -548,10 +630,20 @@ class Planner:
         for k in range(1, self.layers + 1):
             name = f"L{k}"
             sp = self.supply[k]
-            center, yaw = self.blocks[name]
-            if not self.segments:
-                self.start_from_zero(center, sp["pitch"])
-            self.pick(name, center, yaw, sp["pitch"], f"叠{k}/取")
+            if self.feed_mode == "hand":
+                center, yaw = sp["center"].copy(), sp["yaw"]
+                hover = grasp_point_from_center(center) + np.array([0, 0, APPROACH])
+                if not self.segments:
+                    self.start_from_zero(center, sp["pitch"])
+                self.travel_to_hover(f"叠{k}/去递料点", hover, sp["pitch"], target=None)
+                self.wait(f"叠{k}/等待递料", feed_message(k, sp, "stack"))
+                self.blocks[name] = (center, yaw)
+                self.pick(name, center, yaw, sp["pitch"], f"叠{k}/取", travel=False)
+            else:
+                center, yaw = self.blocks[name]
+                if not self.segments:
+                    self.start_from_zero(center, sp["pitch"])
+                self.pick(name, center, yaw, sp["pitch"], f"叠{k}/取")
             self.place(name, layer_center(k), sp["pitch"], f"叠{k}/放", k_layer=k)
             self.tower.append(name)
         self.go_home("叠塔完成")
@@ -569,9 +661,27 @@ class Planner:
             if not self.segments or np.allclose(self.q, 0):
                 self.start_from_zero(center, sp["pitch"])
             self.pick(name, center, yaw, sp["pitch"], f"拆{k}/取")
-            self.place(name, sp["center"], sp["pitch"], f"拆{k}/放")
+            if self.feed_mode == "hand":
+                _, hover = self.place_hover(sp["center"])
+                self.travel_to_hover(f"拆{k}/去递料点", hover, sp["pitch"], target=name)
+                self.wait(f"拆{k}/等待垫块", feed_message(k, sp, "unstack"))
+                self.place(name, sp["center"], sp["pitch"], f"拆{k}/放", travel=False)
+                self.wait(f"拆{k}/等待取走", f"请取走第 {k} 块木块和垫块，撤手后回车。")
+                del self.blocks[name]
+            else:
+                self.place(name, sp["center"], sp["pitch"], f"拆{k}/放")
             self.tower.pop()
         self.go_home("拆塔完成")
+
+
+def feed_message(k, sp, phase):
+    c, H = sp["center"], sp.get("support", 0.0)
+    pad = "直接放在桌面上" if H < 0.5 else f"放在高 {H:.0f} mm 的垫块上"
+    where = f"夹爪正下方（约 ({c[0]:.0f}, {c[1]:.0f}) mm）"
+    if phase == "stack":
+        return (f"请把第 {k} 块木块{pad}，置于{where}、两指中间，一边正对机械臂基座；"
+                "撤手后回车，机械臂将下降夹取。")
+    return f"请在{where}放好{('（无需垫块，桌面即可）' if H < 0.5 else f'高 {H:.0f} mm 的垫块')}；撤手后回车，木块将下降放下。"
 
 
 def rot_z(a):
@@ -579,8 +689,8 @@ def rot_z(a):
     return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
 
 
-def build_plan(layers, phase="both"):
-    pl = Planner(layers)
+def build_plan(layers, phase="both", feed_mode=None):
+    pl = Planner(layers, feed_mode)
     if phase in ("stack", "both"):
         pl.stack_phase()
     if phase in ("unstack", "both"):
@@ -776,16 +886,21 @@ def check_plan(pl, stride=2, raise_on_fail=True):
 def summarize(pl):
     L = [f"\n========== 叠塔 {pl.layers} 层 + 拆塔 =========="]
     L.append(f"塔位 {TOWER_XY} mm（r={np.hypot(*TOWER_XY):.0f}），桌面 z={TABLE_Z}，木块 {BLOCK_SIZE} mm")
-    L.append("供料位（开机前按此摆放；木块一边朝向基座中心，即正对机械臂）：")
+    if pl.feed_mode == "hand":
+        L.append(f"人工递料点（方位 {FEED_AZIMUTH_DEG:.0f}°；机械臂停在上方后，按提示把垫块+木块放到两指正下方）：")
+    else:
+        L.append("供料位（开机前按此摆放；木块一边朝向基座中心，即正对机械臂）：")
     for k, s in pl.supply.items():
         c = s["center"]
-        L.append(f"  L{k}: ({c[0]:.1f}, {c[1]:.1f}) mm  r={np.hypot(c[0], c[1]):.0f}  "
+        pad = f"垫块 {s.get('support', 0.0):3.0f} mm  " if pl.feed_mode == "hand" else ""
+        L.append(f"  L{k}: {pad}({c[0]:.1f}, {c[1]:.1f}) mm  r={np.hypot(c[0], c[1]):.0f}  "
                  f"朝向 {np.rad2deg(s['yaw']):.1f}°  夹持俯仰 {s['pitch']:.1f}°  "
                  f"(塔位窗口 {s['tower_window'][0]:.1f}~{s['tower_window'][1]:.1f}°，"
                  f"重叠 {s['overlap'][1] - s['overlap'][0]:.1f}°)")
     c = pl.checks
     total = sum(s.duration for s in pl.segments)
-    L.append(f"总时长 {total:.0f} s；关节最小余量 {c['min_joint_margin']:.1f}°；"
+    waits = sum(1 for s in pl.segments if s.kind == "wait")
+    L.append(f"运动总时长 {total:.0f} s（另有 {waits} 次人工等待）；关节最小余量 {c['min_joint_margin']:.1f}°；"
              f"最大角速度 {c['max_joint_speed']:.0f}°/s；最大正解误差 {c['max_fk_error']:.4f} mm")
     L.append(f"夹指最低点高出被夹木块底面至少 {c['min_finger_margin']:.1f} mm；"
              f"手中木块离桌面最低 {c['min_held_clear']:.1f} mm；"
@@ -847,15 +962,17 @@ def save_overview(pl, path):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 6))
     for k, s in pl.supply.items():
         col = COLORS[(k - 1) % len(COLORS)]
-        draw_square(ax1, s["center"], s["yaw"], color=col, alpha=0.6)
-        ax1.annotate(f"L{k}\n{s['pitch']:.0f}°", s["center"][:2], ha="center", va="center", fontsize=8)
+        draw_square(ax1, s["center"], s["yaw"], color=col, alpha=0.45)
+        pad = f"\n+{s['support']:.0f}mm" if s.get("support", 0) > 0.5 else ""
+        ax1.annotate(f"L{k} {s['pitch']:.0f}°{pad}", s["center"][:2], xytext=(18 * ((k % 2) * 2 - 1), 0),
+                     textcoords="offset points", ha="center", va="center", fontsize=7)
         ax1.plot([s["center"][0], TOWER_XY[0]], [s["center"][1], TOWER_XY[1]], ":", color=col, lw=0.8)
     draw_square(ax1, layer_center(1), tower_yaw(), color="0.3", alpha=0.7)
     ax1.annotate("tower", TOWER_XY, xytext=(5, -14), textcoords="offset points", fontsize=8)
     ax1.plot(0, 0, "ks")
     ax1.set_aspect("equal")
     ax1.grid(alpha=0.3)
-    ax1.set_title("Top view: supply positions (pitch) and tower")
+    ax1.set_title("Top view: feed/supply points (pitch, support height) and tower")
     ax1.set_xlabel("X_base (mm)")
     ax1.set_ylabel("Y_base (mm)")
     # 侧视：每层放置瞬间的手臂骨架 + 塔
@@ -986,6 +1103,11 @@ def execute(ser, pl, step=False):
         if seg.phase != last_phase and last_phase is not None:
             input(f"\n{last_phase} 阶段完成。检查塔/木块状态，撤手后回车继续 {seg.phase}：")
         last_phase = seg.phase
+        if seg.kind == "wait":
+            ans = input(f"\n[{seg.label}] {seg.message}\n（回车继续，q 中止）：")
+            if ans.strip().lower() == "q":
+                raise KeyboardInterrupt
+            continue
         if step and seg.kind == "grip":
             ans = input(f"[{seg.label}] 即将{'夹紧' if seg.q[-1, 5] == GRIP_CLOSE_DEG else '松开'}，"
                         "回车继续，q 中止：")
@@ -1000,17 +1122,20 @@ def execute(ser, pl, step=False):
 # 11. 扫描：各层俯仰窗口与可叠层数
 # ============================================================
 
-def run_scan():
-    print(f"塔位 {TOWER_XY}（r={np.hypot(*TOWER_XY):.0f} mm），供料方位 {SUPPLY_AZIMUTHS_DEG}")
+def run_scan(feed_mode=None):
+    feed_mode = feed_mode or FEED_MODE
+    print(f"塔位 {TOWER_XY}（r={np.hypot(*TOWER_XY):.0f} mm），供料方式 {feed_mode}")
     for k in range(1, MAX_LAYERS + 2):
         g = grasp_point_from_center(layer_center(k), k) + np.array([0, 0, RELEASE_GAP])
         W = pitch_window(g, g + np.array([0, 0, APPROACH]))
         print(f"  L{k}: 中心 z={layer_center(k)[2]:.0f}  塔位俯仰窗口 {W}")
     for n in range(1, MAX_LAYERS + 1):
         try:
-            sup = plan_supply(n)
-            print(f"{n} 层：可行；供料半径 " + ", ".join(
-                f"L{k}:{np.hypot(*s['center'][:2]):.0f}" for k, s in sup.items()))
+            sup = plan_feed(n) if feed_mode == "hand" else plan_supply(n)
+            print(f"{n} 层：可行；" + ", ".join(
+                f"L{k}: r={np.hypot(*s['center'][:2]):.0f}"
+                + (f"/垫{s.get('support', 0):.0f}" if feed_mode == "hand" else "")
+                + f"/{s['pitch']:.0f}°" for k, s in sup.items()))
         except IKError as e:
             print(f"{n} 层：不可行（{e}）")
             break
@@ -1021,7 +1146,7 @@ def run_scan():
 # ============================================================
 
 def main():
-    global TOWER_XY, GRASP_Z_OFFSET
+    global TOWER_XY, GRASP_Z_OFFSET, FEED_SUPPORT_HEIGHTS, RELEASE_GAP
     ap = argparse.ArgumentParser(description="第六周附加题：多层叠塔 + 逐层拆塔（重构版）")
     ap.add_argument("--mode", choices=("plan", "simulate", "hardware", "calib", "scan"), default="plan")
     ap.add_argument("--layers", type=int, default=3)
@@ -1029,6 +1154,10 @@ def main():
     ap.add_argument("--port", default=SERIAL_PORT)
     ap.add_argument("--tower", type=float, nargs=2, metavar=("X", "Y"))
     ap.add_argument("--grasp-offset", type=float, help="夹取点相对木块中心的高度（mm）")
+    ap.add_argument("--feed", choices=("hand", "table"), default=FEED_MODE,
+                    help="hand：人工递料（垫块定高，可到 8 层）；table：开机前预摆在桌面（≤5 层，全自动）")
+    ap.add_argument("--supports", help="可用垫块高度列表（mm），如 0,30,60,90,120")
+    ap.add_argument("--release-gap", type=float, help="放置时木块底面高出支撑面（mm）")
     ap.add_argument("--step", action="store_true", help="每次夹紧/松开前回车确认")
     ap.add_argument("--speed", type=float, default=4.0, help="仿真回放倍速")
     ap.add_argument("--save-frames", help="仿真帧导出目录（不弹窗）")
@@ -1037,19 +1166,24 @@ def main():
         TOWER_XY = tuple(args.tower)
     if args.grasp_offset is not None:
         GRASP_Z_OFFSET = args.grasp_offset
+    if args.supports:
+        FEED_SUPPORT_HEIGHTS = tuple(float(x) for x in args.supports.split(","))
+    if args.release_gap is not None:
+        RELEASE_GAP = args.release_gap
 
     if args.mode == "scan":
-        run_scan()
+        run_scan(args.feed)
         return
 
     if args.mode == "calib":
-        pl = Planner(args.layers)
+        pl = Planner(args.layers, args.feed)
         s = pl.supply[1]
         g = grasp_point_from_center(s["center"])
         pl.start_from_zero(s["center"], s["pitch"])
         pl.travel_to_hover("标定", g + np.array([0, 0, APPROACH]), s["pitch"], target="L1")
         pl.vertical("标定/下降", g[2], VERTICAL_SPEED, target="L1")
-        print(f"标定：把 L1 放在 ({s['center'][0]:.1f}, {s['center'][1]:.1f})，一边正对基座。"
+        pad = f"（放在高 {s.get('support', 0):.0f} mm 的垫块上）" if s.get("support", 0) > 0.5 else ""
+        print(f"标定：把 L1{pad}放在 ({s['center'][0]:.1f}, {s['center'][1]:.1f})，一边正对基座。"
               f"夹爪将张开停在夹取高度（俯仰 {s['pitch']:.1f}°），不会闭合。")
         if input("撤手后输入 YES 开始：").strip().upper() != "YES":
             return
@@ -1060,7 +1194,7 @@ def main():
             print("请核对：①两指是否对称地跨在木块两侧；②指尖最低点高出桌面多少；"
                   "③木块中心与两指中心的水平偏差。偏差写入 SUPPLY_XY_COMP / GRASP_Z_OFFSET。")
             input("核对完成后回车，机械臂竖直抬起并回零：")
-            back = Planner(args.layers)
+            back = Planner(args.layers, args.feed)
             back.q, back.grip = pl.q.copy(), pl.grip
             back.blocks = pl.blocks
             back.under = "L1"
@@ -1071,7 +1205,7 @@ def main():
             ser.close()
         return
 
-    pl = build_plan(args.layers, args.phase)
+    pl = build_plan(args.layers, args.phase, args.feed)
     check_plan(pl, raise_on_fail=(args.mode == "hardware"))
     print(summarize(pl))
     if pl.checks["issues"]:
@@ -1081,7 +1215,7 @@ def main():
         worst = max(float(np.linalg.norm(robot.fkine(np.deg2rad(s.q[i, :5])).t - grip_point(s.q[i])))
                     for s in pl.segments for i in (0, len(s.q) - 1))
         print(f"roboticstoolbox 正解复核：最大差异 {worst:.2e} mm")
-    tag = f"stack{args.layers}_{args.phase}"
+    tag = f"stack{args.layers}_{args.phase}_{args.feed}"
     export(pl, OUTPUT_DIR, tag)
     save_overview(pl, OUTPUT_DIR / f"{tag}_overview.png")
     print(f"已导出 {tag}_trajectory.csv / _summary.json / _overview.png（目录 {OUTPUT_DIR}）")
