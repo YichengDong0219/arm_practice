@@ -14,7 +14,7 @@ week6/task3_new.py 用“近水平夹爪”（J2+J3+J4≈-90°±10°）抓取。
 2. 俯仰一致：同一块木块从夹起到放下，夹爪俯仰必须相同，否则木块在手中被
    转歪、放到塔上会倾斜。受 J3/J4 限位约束，每层在塔位只有一个窄俯仰窗口，
    因此程序为每层计算一个取料点，使它与该层塔位的俯仰窗口重叠。两种供料方式：
-   - 人工递料（--feed hand，默认，可到 10 层）：每层一个“垫块高度 + 水平位置”的
+   - 人工递料（--feed hand，默认，可到 11 层）：每层一个“垫块高度 + 水平位置”的
      递料点。机械臂张爪停在递料点上方后静止等待，人把垫块和木块放到两指正下方，
      撤手回车，机械臂再下降夹取；拆塔时反过来。垫块定住木块高度（手持悬空会让
      夹持高度有几毫米随机误差，放到高塔上会压塔或掉落），水平位置随夹爪摆放。
@@ -102,8 +102,10 @@ BLOCK_SIZE = 30.0                # h
 TOWER_XY = (200.0, -45.0)        # 塔位（r≈205 mm，俯仰窗口比 r≈184 宽 2~5 倍）
 SUPPLY_AZIMUTHS_DEG = (30.0, 52.0)   # 供料位所在方位（远离塔，交替使用避免互相重叠）
 SUPPLY_SPACING = 12.0            # 相邻供料块之间的最小间隙
-MAX_LAYERS = 10
+MAX_LAYERS = 11                  # 极限：12 层能放上去但撤不出来——放完后夹指仍跨在第 12 块两侧，
+                                 # 须把夹取点抬到约 426 mm 才能横移离开，而塔位上方手臂最高约 424 mm
 BASE_MAX_LAYERS = 8              # ≤8 层时沿用原有全部参数（递料点、垫块、俯仰网格均不变）
+HIGH_MAX_LAYERS = 10             # 9~10 层的参数见 HIGH_*；11 层以上另见 EXTREME_*（≤10 层不受影响）
 
 # 供料方式：
 #   "hand"  人工递料（默认）：每层一个递料点（垫块高度 + 水平位置），机械臂张爪停在
@@ -122,6 +124,18 @@ FEED_MIN_OVERLAP = 3.0           # 递料点与塔位俯仰窗口的最小重叠
 # 必须把木块垫到 210~240 mm 高；递料点也要离基座近一些（远处手臂举不到越障高度）。
 HIGH_FEED_SUPPORT_HEIGHTS = (150.0, 180.0, 210.0, 240.0)
 HIGH_FEED_RADIUS_RANGE = (150.0, 330.0)
+
+# 第 11 层以上专用（仅当层数 > HIGH_MAX_LAYERS 时启用；L1~L10 完全不变）：
+# - 放置时夹爪需上仰 30° 以上，递料点要离基座更近（那里手臂举得更高），木块垫到 270~360 mm；
+# - 上仰时指根随之下沉，夹取点相对木块中心上移 EXTREME_GRASP_Z_OFFSET，保证夹指不低于木块底面
+#   （否则放塔会刮到下层、在递料台上会刮到台面）。
+EXTREME_FEED_SUPPORT_HEIGHTS = (240.0, 270.0, 300.0, 330.0, 360.0)
+EXTREME_FEED_RADIUS_RANGE = (130.0, 300.0)
+EXTREME_FEED_PREFER_R = 200.0
+EXTREME_GRASP_Z_OFFSET = 4.0
+EXTREME_PITCH_FROM_LOW = 3.0     # 高层放置俯仰取可行区间下端 +3°：上仰越小，手腕越高，越不易碰塔
+EXTREME_RETREAT_R = 150.0        # 11 层以上回零前先撤到该半径（递料方位）上方，避免扫过塔顶
+EXTREME_TRANSIT_CLEAR = 15.0     # 11 层以上越障余量（≤10 层仍为 25 mm），手臂高度已接近极限
 
 # 竖直进出与放置
 APPROACH = 12.0                  # 在供料位/塔位上方以夹取俯仰竖直进出的距离
@@ -162,13 +176,19 @@ MAX_FK_ERROR = 0.5
 OUTPUT_DIR = Path(__file__).resolve().parent / "stack_output"
 PITCH_GRID_BASE = np.arange(-85.0, 20.0, 0.5)   # ≤8 层：高塔越障时需要接近水平甚至略上仰
 PITCH_GRID_HIGH = np.arange(-85.0, 60.0, 0.5)   # 9~10 层：第 10 层放置约 +14°，越障时还需更大上仰
+PITCH_GRID_EXTREME = np.arange(-85.0, 80.0, 0.5)   # 11 层以上：第 12 层放置需上仰约 30°~60°
 PITCH_GRID = PITCH_GRID_BASE
 
 
 def use_pitch_grid(layers):
     """按层数选择俯仰搜索网格；≤8 层保持原网格，保证原有规划结果逐帧不变。"""
     global PITCH_GRID
-    PITCH_GRID = PITCH_GRID_HIGH if layers > BASE_MAX_LAYERS else PITCH_GRID_BASE
+    if layers > HIGH_MAX_LAYERS:
+        PITCH_GRID = PITCH_GRID_EXTREME
+    elif layers > BASE_MAX_LAYERS:
+        PITCH_GRID = PITCH_GRID_HIGH
+    else:
+        PITCH_GRID = PITCH_GRID_BASE
 
 
 # ============================================================
@@ -304,8 +324,23 @@ def tower_yaw():
     return float(np.arctan2(TOWER_XY[1], TOWER_XY[0]))
 
 
-def grasp_point_from_center(center, k_layer=None):
-    z = center[2] + GRASP_Z_OFFSET + (TOWER_Z_COMP.get(k_layer, 0.0) if k_layer else 0.0)
+def block_index(block):
+    """木块编号：接受整数 k 或名字 "Lk"。"""
+    if block is None:
+        return None
+    return int(block[1:]) if isinstance(block, str) else int(block)
+
+
+def grasp_offset(block=None):
+    """夹取点相对木块中心的高度：≤10 层的木块为 GRASP_Z_OFFSET；第 11 层以上的木块再上移。"""
+    k = block_index(block)
+    extra = EXTREME_GRASP_Z_OFFSET if (k is not None and k > HIGH_MAX_LAYERS) else 0.0
+    return GRASP_Z_OFFSET + extra
+
+
+def grasp_point_from_center(center, k_layer=None, block=None):
+    z = (center[2] + grasp_offset(block if block is not None else k_layer)
+         + (TOWER_Z_COMP.get(k_layer, 0.0) if k_layer else 0.0))
     return np.array([center[0], center[1], z])
 
 
@@ -363,12 +398,13 @@ def plan_feed(layers):
     az = np.deg2rad(FEED_AZIMUTH_DEG)
     cache = {}
 
-    def feed_window(H, r):
-        if (H, r) not in cache:
-            z = TABLE_Z + H + BLOCK_SIZE / 2 + GRASP_Z_OFFSET
+    def feed_window(H, r, k):
+        off = grasp_offset(k)
+        if (H, r, off) not in cache:
+            z = TABLE_Z + H + BLOCK_SIZE / 2 + off
             p0 = np.array([r, 0.0, z])
-            cache[(H, r)] = pitch_window(p0, p0 + np.array([0, 0, APPROACH + RELEASE_GAP]))
-        return cache[(H, r)]
+            cache[(H, r, off)] = pitch_window(p0, p0 + np.array([0, 0, APPROACH + RELEASE_GAP]))
+        return cache[(H, r, off)]
 
     feed = {}
     for k in range(1, layers + 1):
@@ -378,12 +414,17 @@ def plan_feed(layers):
             raise IKError(f"第 {k} 层塔位在任何俯仰下都不可达")
         best = None
         for need in (FEED_MIN_OVERLAP, 1.0):
+            extreme = k > HIGH_MAX_LAYERS
             high = k > BASE_MAX_LAYERS
-            heights = HIGH_FEED_SUPPORT_HEIGHTS if high else FEED_SUPPORT_HEIGHTS
-            r_lo, r_hi = HIGH_FEED_RADIUS_RANGE if high else FEED_RADIUS_RANGE
+            if extreme:
+                heights, (r_lo, r_hi) = EXTREME_FEED_SUPPORT_HEIGHTS, EXTREME_FEED_RADIUS_RANGE
+            elif high:
+                heights, (r_lo, r_hi) = HIGH_FEED_SUPPORT_HEIGHTS, HIGH_FEED_RADIUS_RANGE
+            else:
+                heights, (r_lo, r_hi) = FEED_SUPPORT_HEIGHTS, FEED_RADIUS_RANGE
             for H in sorted(heights):
                 for r in np.arange(r_lo, r_hi + 0.1, 4.0):
-                    S = feed_window(H, r)
+                    S = feed_window(H, r, k)
                     if S is None:
                         continue
                     lo, hi = max(W[0], S[0]), min(W[1], S[1])
@@ -392,6 +433,10 @@ def plan_feed(layers):
                     # 重叠越宽越好（离限位越远）；垫块越低越稳；半径靠近 250 mm
                     # 时手臂不过分伸展、下垂小。三者折中，宁可多垫一块也不贴着臂展边缘。
                     score = (hi - lo) - 0.03 * H - 0.05 * abs(r - 250.0)
+                    if extreme:   # 11 层以上：优先最小的放置上仰角，其次递料点靠近基座
+                        if hi - lo < max(need, EXTREME_PITCH_FROM_LOW):
+                            continue
+                        score = -lo - 0.02 * abs(r - EXTREME_FEED_PREFER_R) - 0.01 * H
                     if best is None or score > best[0]:
                         best = (score, H, r, (lo, hi), S)
             if best:
@@ -400,7 +445,10 @@ def plan_feed(layers):
             raise IKError(f"第 {k} 层找不到俯仰匹配的递料点（塔位窗口 {W}）；可增加更高的垫块")
         _, H, r, ov, S = best
         center = np.array([r * np.cos(az), r * np.sin(az), TABLE_Z + H + BLOCK_SIZE / 2])
-        feed[k] = {"center": center, "yaw": float(az), "pitch": float((ov[0] + ov[1]) / 2),
+        pitch = (ov[0] + ov[1]) / 2
+        if k > HIGH_MAX_LAYERS:
+            pitch = ov[0] + min(EXTREME_PITCH_FROM_LOW, (ov[1] - ov[0]) / 2)
+        feed[k] = {"center": center, "yaw": float(az), "pitch": float(pitch),
                    "overlap": ov, "tower_window": W, "supply_window": S, "azimuth": FEED_AZIMUTH_DEG,
                    "support": float(H)}
     return feed
@@ -517,7 +565,10 @@ class Planner:
         pitch0 = tool_pitch(self.q)
         dist = float(np.linalg.norm(p1 - p0))
         duration = max(0.5, dist / speed, 1.875 * abs(pitch1 - pitch0) / MOVEJ_SPEED_DEG_S)
+        base_duration = duration
         for _ in range(6):
+            if duration > 8.0 * base_duration:   # 放慢 8 倍仍超速：是分支跳变，放慢无效
+                raise IKError(f"{label}: 逆解分支跳变（放慢也无法连续）")
             qs, pts, pitches = line_points(p0, np.asarray(p1, float), pitch0, pitch1, self.q, duration)
             vel = np.max(np.abs(np.diff(qs[:, :4], axis=0))) / SEND_PERIOD_S if len(qs) > 1 else 0
             if vel <= 0.9 * JOINT_SPEED_LIMIT_DEG_S:
@@ -553,9 +604,12 @@ class Planner:
     # ---------- 组合动作 ----------
     def transit_z(self):
         top = self.top_of_obstacles()
+        extreme = self.layers > HIGH_MAX_LAYERS
+        clear_held = EXTREME_TRANSIT_CLEAR if extreme else TRANSIT_CLEAR_HELD
+        clear_empty = EXTREME_TRANSIT_CLEAR if extreme else TRANSIT_CLEAR_EMPTY
         if self.held:
-            return top + TRANSIT_CLEAR_HELD + BLOCK_SIZE / 2 + abs(GRASP_Z_OFFSET) + 6.0
-        return top + TRANSIT_CLEAR_EMPTY + FINGER_TIP + FINGER_HALF_W
+            return top + clear_held + BLOCK_SIZE / 2 + abs(GRASP_Z_OFFSET) + 6.0
+        return top + clear_empty + FINGER_TIP + FINGER_HALF_W
 
     def travel_to_hover(self, label, hover, hover_pitch, target):
         """竖直上升 → 高处横移 → 竖直下降到目标上方。
@@ -578,33 +632,79 @@ class Planner:
         cand_b = sorted(PITCH_GRID, key=lambda x: abs(x - hover_pitch))
         cand_a = [x for x in cand_a if best_margin(up, x) >= JOINT_MARGIN_DEG + 1][:40]
         cand_b = [x for x in cand_b if best_margin(above, x) >= JOINT_MARGIN_DEG + 1][:40]
-        choice = None
-        for a in cand_a:
-            if not line_feasible(up_c, up, pitch_here, a):
-                continue
-            for b in cand_b:
-                if line_feasible(up, above, a, b, n=9) and line_feasible(above, dn_c, b, hover_pitch):
-                    choice = (a, b)
-                    break
-            if choice:
+        def candidates():
+            for a in cand_a:
+                if not line_feasible(up_c, up, pitch_here, a):
+                    continue
+                for b in cand_b:
+                    if line_feasible(up, above, a, b, n=9) and line_feasible(above, dn_c, b, hover_pitch):
+                        yield a, b
+
+        # 逐个候选尝试生成整条越障路线；某段出现逆解分支跳变时回滚并换下一组俯仰。
+        # 原本能成功的路线第一个候选即成功，结果与旧版完全相同。
+        saved = (len(self.segments), self.q.copy(), self.grip, self.under)
+        last_err, tried = None, 0
+        for a, b in candidates():
+            tried += 1
+            try:
+                if z_up_c - here[2] > 0.5:
+                    self.line(f"{label}/竖直上升", up_c, pitch_here, VERTICAL_SPEED, target=self.under)
+                if zt - z_up_c > 0.5 or abs(a - pitch_here) > 0.1:
+                    self.line(f"{label}/上升转角", up, a, VERTICAL_SPEED, target=self.under)
+                self.line(f"{label}/横移", above, b, TRANSIT_SPEED)
+                if zt - z_dn_c > 0.5 or abs(b - hover_pitch) > 0.1:
+                    self.line(f"{label}/下降转角", dn_c, hover_pitch, VERTICAL_SPEED, target=target)
+                if z_dn_c - hover[2] > 0.5:
+                    self.line(f"{label}/竖直下降", hover, hover_pitch, VERTICAL_SPEED, target=target)
                 break
-        if choice is None:
-            raise IKError(f"{label}: 找不到可行的越障路线（越障高度 {zt:.0f} mm）")
-        a, b = choice
-        if z_up_c - here[2] > 0.5:
-            self.line(f"{label}/竖直上升", up_c, pitch_here, VERTICAL_SPEED, target=self.under)
-        if zt - z_up_c > 0.5 or abs(a - pitch_here) > 0.1:
-            self.line(f"{label}/上升转角", up, a, VERTICAL_SPEED, target=self.under)
-        self.line(f"{label}/横移", above, b, TRANSIT_SPEED)
-        if zt - z_dn_c > 0.5 or abs(b - hover_pitch) > 0.1:
-            self.line(f"{label}/下降转角", dn_c, hover_pitch, VERTICAL_SPEED, target=target)
-        if z_dn_c - hover[2] > 0.5:
-            self.line(f"{label}/竖直下降", hover, hover_pitch, VERTICAL_SPEED, target=target)
+            except IKError as e:
+                last_err = e
+                del self.segments[saved[0]:]
+                self.q, self.grip, self.under = saved[1].copy(), saved[2], saved[3]
+                if tried >= 30:
+                    break
+        else:
+            if tried == 0 and not self._transit_movej(label, here, pitch_here, up_c, z_up_c, up, zt,
+                                                      above, hover, hover_pitch, target):
+                raise IKError(f"{label}: 找不到可行的越障路线（越障高度 {zt:.0f} mm）")
+        if last_err is not None and len(self.segments) == saved[0]:
+            # 笛卡尔横移都需要中途切换肘部构型：改在高处用关节空间运动切换（仅 11 层以上会用到）
+            if not self._transit_movej(label, here, pitch_here, up_c, z_up_c, up, zt,
+                                       above, hover, hover_pitch, target):
+                raise IKError(f"{label}: 越障路线均出现逆解分支跳变（{last_err}）")
         self.under = target          # 已离开原来那块，下方变为新的目标（可能为空）
+
+    def _transit_movej(self, label, here, pitch_here, up_c, z_up_c, up, zt, above, hover, hover_pitch, target):
+        """备选越障：竖直升到越障高度 → 高处关节空间运动（允许切换肘部构型）→ 竖直下降。
+
+        只在所有笛卡尔越障路线都失败时调用；关节空间段的末端路径由离线碰撞检查覆盖。
+        """
+        saved = (len(self.segments), self.q.copy(), self.grip, self.under)
+        cand_a = [x for x in sorted(PITCH_GRID, key=lambda x: abs(x - pitch_here))
+                  if line_feasible(up_c, up, pitch_here, x)][:20]
+        cand_b = [x for x in sorted(PITCH_GRID, key=lambda x: abs(x - hover_pitch))
+                  if best_margin(above, x) >= JOINT_MARGIN_DEG + 1 and line_feasible(above, hover, x, hover_pitch)][:20]
+        for a in cand_a:
+            for b in cand_b:
+                for q_top in sorted((q for q in ik_candidates(above, b) if joint_margin(q) >= JOINT_MARGIN_DEG + 1),
+                                    key=lambda q: -joint_margin(q)):
+                    try:
+                        if z_up_c - here[2] > 0.5:
+                            self.line(f"{label}/竖直上升", up_c, pitch_here, VERTICAL_SPEED, target=self.under)
+                        if zt - z_up_c > 0.5 or abs(a - pitch_here) > 0.1:
+                            self.line(f"{label}/上升转角", up, a, VERTICAL_SPEED, target=self.under)
+                        self.movej(f"{label}/高处关节换构型", q_top)
+                        if np.linalg.norm(grip_point(self.q) - hover) > 0.5 or abs(b - hover_pitch) > 0.1:
+                            self.line(f"{label}/下降", hover, hover_pitch, VERTICAL_SPEED, target=target)
+                        return True
+                    except IKError:
+                        del self.segments[saved[0]:]
+                        self.q, self.grip, self.under = saved[1].copy(), saved[2], saved[3]
+        return False
 
     def pick(self, name, center, yaw, pitch, label, travel=True):
         """张爪竖直下降 → 静置 → 慢合 → 静置 → 慢起。travel=False 表示已在夹取点上方。"""
-        g = grasp_point_from_center(center)
+        g = grasp_point_from_center(center, block=name)
         hover = g + np.array([0, 0, APPROACH])
         if travel:
             self.travel_to_hover(f"{label}/去夹取", hover, pitch, target=name)
@@ -625,13 +725,13 @@ class Planner:
         self.vertical(f"{label}/抬起", g[2] + APPROACH + sag, VERTICAL_SPEED, target=name)
         self.under = name
 
-    def place_hover(self, center, k_layer=None):
-        g = grasp_point_from_center(center, k_layer) + np.array([0, 0, RELEASE_GAP + HOLD_SAG_COMP])
+    def place_hover(self, center, k_layer=None, block=None):
+        g = grasp_point_from_center(center, k_layer, block) + np.array([0, 0, RELEASE_GAP + HOLD_SAG_COMP])
         return g, g + np.array([0, 0, APPROACH])
 
     def place(self, name, center, pitch, label, k_layer=None, travel=True):
         """竖直下降到“底面高出支撑面 RELEASE_GAP” → 静置 → 慢开 → 静置 → 慢起。"""
-        g, hover = self.place_hover(center, k_layer)
+        g, hover = self.place_hover(center, k_layer, block=name)
         if travel:
             self.travel_to_hover(f"{label}/去放置", hover, pitch, target=name)
         self.vertical(f"{label}/下降", g[2] + SLOW_ZONE, VERTICAL_SPEED, target=name)
@@ -664,6 +764,15 @@ class Planner:
                         self.line(f"{label}/上升转角", np.array([here[0], here[1], zt]), a,
                                   VERTICAL_SPEED, target=self.under)
                         break
+        if (self.layers > HIGH_MAX_LAYERS
+                and self.top_of_obstacles() > TABLE_Z + BLOCK_SIZE * HIGH_MAX_LAYERS + 1e-6):
+            # 塔高超过 10 层时：塔顶已接近手臂最高点，直接关节回零会扫过塔顶。先在高处横移到
+            # 塔外侧（递料方位、靠近基座），再回零。≤10 层不执行此步。
+            az = np.deg2rad(FEED_AZIMUTH_DEG)
+            p_out = np.array([EXTREME_RETREAT_R * np.cos(az), EXTREME_RETREAT_R * np.sin(az),
+                              max(self.transit_z(), grip_point(self.q)[2])])
+            if np.linalg.norm(grip_point(self.q)[:2] - p_out[:2]) > 1.0:
+                self.travel_to_hover(f"{label}/离开塔顶", p_out, best_pitch(p_out), target=None)
         self.movej(f"{label}/回零", np.zeros(5), duration=3.0)
 
     def start_from_zero(self, first_hover, pitch):
@@ -681,7 +790,7 @@ class Planner:
             sp = self.supply[k]
             if self.feed_mode == "hand":
                 center, yaw = sp["center"].copy(), sp["yaw"]
-                hover = grasp_point_from_center(center) + np.array([0, 0, APPROACH])
+                hover = grasp_point_from_center(center, block=name) + np.array([0, 0, APPROACH])
                 if not self.segments:
                     self.start_from_zero(center, sp["pitch"])
                 self.travel_to_hover(f"叠{k}/去递料点", hover, sp["pitch"], target=None)
@@ -711,7 +820,7 @@ class Planner:
                 self.start_from_zero(center, sp["pitch"])
             self.pick(name, center, yaw, sp["pitch"], f"拆{k}/取")
             if self.feed_mode == "hand":
-                _, hover = self.place_hover(sp["center"])
+                _, hover = self.place_hover(sp["center"], block=name)
                 self.travel_to_hover(f"拆{k}/去递料点", hover, sp["pitch"], target=name)
                 self.wait(f"拆{k}/等待垫块", feed_message(k, sp, "unstack"))
                 self.place(name, sp["center"], sp["pitch"], f"拆{k}/放", travel=False)
@@ -1227,7 +1336,7 @@ def main():
     ap.add_argument("--tower", type=float, nargs=2, metavar=("X", "Y"))
     ap.add_argument("--grasp-offset", type=float, help="夹取点相对木块中心的高度（mm）")
     ap.add_argument("--feed", choices=("hand", "table"), default=FEED_MODE,
-                    help="hand：人工递料（垫块定高，可到 10 层）；table：开机前预摆在桌面（≤5 层，全自动）")
+                    help="hand：人工递料（垫块定高，可到 11 层）；table：开机前预摆在桌面（≤5 层，全自动）")
     ap.add_argument("--supports", help="可用垫块高度列表（mm），如 0,30,60,90,120")
     ap.add_argument("--release-gap", type=float, help="放置时木块底面高出支撑面（mm）")
     ap.add_argument("--step", action="store_true", help="每次夹紧/松开前回车确认")
