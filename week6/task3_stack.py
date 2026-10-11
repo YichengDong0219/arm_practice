@@ -14,7 +14,7 @@ week6/task3_new.py 用“近水平夹爪”（J2+J3+J4≈-90°±10°）抓取。
 2. 俯仰一致：同一块木块从夹起到放下，夹爪俯仰必须相同，否则木块在手中被
    转歪、放到塔上会倾斜。受 J3/J4 限位约束，每层在塔位只有一个窄俯仰窗口，
    因此程序为每层计算一个取料点，使它与该层塔位的俯仰窗口重叠。两种供料方式：
-   - 人工递料（--feed hand，默认，可到 8 层）：每层一个“垫块高度 + 水平位置”的
+   - 人工递料（--feed hand，默认，可到 10 层）：每层一个“垫块高度 + 水平位置”的
      递料点。机械臂张爪停在递料点上方后静止等待，人把垫块和木块放到两指正下方，
      撤手回车，机械臂再下降夹取；拆塔时反过来。垫块定住木块高度（手持悬空会让
      夹持高度有几毫米随机误差，放到高塔上会压塔或掉落），水平位置随夹爪摆放。
@@ -102,18 +102,26 @@ BLOCK_SIZE = 30.0                # h
 TOWER_XY = (200.0, -45.0)        # 塔位（r≈205 mm，俯仰窗口比 r≈184 宽 2~5 倍）
 SUPPLY_AZIMUTHS_DEG = (30.0, 52.0)   # 供料位所在方位（远离塔，交替使用避免互相重叠）
 SUPPLY_SPACING = 12.0            # 相邻供料块之间的最小间隙
-MAX_LAYERS = 8
+MAX_LAYERS = 10
+BASE_MAX_LAYERS = 8              # ≤8 层时沿用原有全部参数（递料点、垫块、俯仰网格均不变）
 
 # 供料方式：
 #   "hand"  人工递料（默认）：每层一个递料点（垫块高度 + 水平位置），机械臂张爪停在
 #           递料点上方，人把“垫块+木块”放到两指正下方，撤手回车后机械臂下降夹取。
-#           垫块定住木块高度，水平位置随夹爪摆放，因此 7~8 层也能匹配俯仰。
+#           垫块定住木块高度，水平位置随夹爪摆放，因此 7~10 层也能匹配俯仰
+#           （9、10 层需 210~240 mm 的稳固台子，见 HIGH_FEED_*）。
 #   "table" 预摆供料：所有木块开机前摆在桌面供料位，全自动（最多约 5 层）。
 FEED_MODE = "hand"
 FEED_SUPPORT_HEIGHTS = (0.0, 30.0, 60.0, 90.0, 120.0)   # 可用垫块高度（0=直接放桌面）
 FEED_AZIMUTH_DEG = 40.0          # 递料点所在方位（远离塔，人手不必靠近塔）
 FEED_RADIUS_RANGE = (180.0, 320.0)
 FEED_MIN_OVERLAP = 3.0           # 递料点与塔位俯仰窗口的最小重叠（deg）
+
+# 第 9、10 层专用（仅当层数 > BASE_MAX_LAYERS 时启用；L1~L8 的递料点不受影响）：
+# 塔高 270~300 mm 时放置需夹爪接近水平甚至略上仰，桌面附近够不到这样的俯仰，
+# 必须把木块垫到 210~240 mm 高；递料点也要离基座近一些（远处手臂举不到越障高度）。
+HIGH_FEED_SUPPORT_HEIGHTS = (150.0, 180.0, 210.0, 240.0)
+HIGH_FEED_RADIUS_RANGE = (150.0, 330.0)
 
 # 竖直进出与放置
 APPROACH = 12.0                  # 在供料位/塔位上方以夹取俯仰竖直进出的距离
@@ -152,7 +160,15 @@ HELD_CLEARANCE = 0.5             # 持块与其他木块/桌面的最小间隙�
 MAX_FK_ERROR = 0.5
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "stack_output"
-PITCH_GRID = np.arange(-85.0, 20.0, 0.5)   # 高塔越障时需要接近水平甚至略上仰
+PITCH_GRID_BASE = np.arange(-85.0, 20.0, 0.5)   # ≤8 层：高塔越障时需要接近水平甚至略上仰
+PITCH_GRID_HIGH = np.arange(-85.0, 60.0, 0.5)   # 9~10 层：第 10 层放置约 +14°，越障时还需更大上仰
+PITCH_GRID = PITCH_GRID_BASE
+
+
+def use_pitch_grid(layers):
+    """按层数选择俯仰搜索网格；≤8 层保持原网格，保证原有规划结果逐帧不变。"""
+    global PITCH_GRID
+    PITCH_GRID = PITCH_GRID_HIGH if layers > BASE_MAX_LAYERS else PITCH_GRID_BASE
 
 
 # ============================================================
@@ -362,8 +378,11 @@ def plan_feed(layers):
             raise IKError(f"第 {k} 层塔位在任何俯仰下都不可达")
         best = None
         for need in (FEED_MIN_OVERLAP, 1.0):
-            for H in sorted(FEED_SUPPORT_HEIGHTS):
-                for r in np.arange(FEED_RADIUS_RANGE[0], FEED_RADIUS_RANGE[1] + 0.1, 4.0):
+            high = k > BASE_MAX_LAYERS
+            heights = HIGH_FEED_SUPPORT_HEIGHTS if high else FEED_SUPPORT_HEIGHTS
+            r_lo, r_hi = HIGH_FEED_RADIUS_RANGE if high else FEED_RADIUS_RANGE
+            for H in sorted(heights):
+                for r in np.arange(r_lo, r_hi + 0.1, 4.0):
                     S = feed_window(H, r)
                     if S is None:
                         continue
@@ -453,6 +472,7 @@ def line_feasible(p0, p1, pitch0, pitch1, n=7, margin=JOINT_MARGIN_DEG + 1.0):
 
 class Planner:
     def __init__(self, layers, feed_mode=None):
+        use_pitch_grid(layers)
         self.layers = layers
         self.feed_mode = feed_mode or FEED_MODE
         self.supply = plan_feed(layers) if self.feed_mode == "hand" else plan_supply(layers)
@@ -705,7 +725,8 @@ class Planner:
 
 def feed_message(k, sp, phase):
     c, H = sp["center"], sp.get("support", 0.0)
-    pad = "直接放在桌面上" if H < 0.5 else f"放在高 {H:.0f} mm 的垫块上"
+    pad = ("直接放在桌面上" if H < 0.5 else f"放在高 {H:.0f} mm 的垫块上" if H <= 120.5
+           else f"放在高 {H:.0f} mm 的稳固台子上（底面要宽，不要用木块叠）")
     where = f"夹爪正下方（约 ({c[0]:.0f}, {c[1]:.0f}) mm）"
     if phase == "stack":
         return (f"请把第 {k} 块木块{pad}，置于{where}、两指中间，一边正对机械臂基座；"
@@ -1174,11 +1195,13 @@ def execute(ser, pl, step=False):
 def run_scan(feed_mode=None):
     feed_mode = feed_mode or FEED_MODE
     print(f"塔位 {TOWER_XY}（r={np.hypot(*TOWER_XY):.0f} mm），供料方式 {feed_mode}")
+    use_pitch_grid(MAX_LAYERS)
     for k in range(1, MAX_LAYERS + 2):
         g = grasp_point_from_center(layer_center(k), k) + np.array([0, 0, RELEASE_GAP])
         W = pitch_window(g, g + np.array([0, 0, APPROACH]))
         print(f"  L{k}: 中心 z={layer_center(k)[2]:.0f}  塔位俯仰窗口 {W}")
     for n in range(1, MAX_LAYERS + 1):
+        use_pitch_grid(n)
         try:
             sup = plan_feed(n) if feed_mode == "hand" else plan_supply(n)
             print(f"{n} 层：可行；" + ", ".join(
@@ -1204,7 +1227,7 @@ def main():
     ap.add_argument("--tower", type=float, nargs=2, metavar=("X", "Y"))
     ap.add_argument("--grasp-offset", type=float, help="夹取点相对木块中心的高度（mm）")
     ap.add_argument("--feed", choices=("hand", "table"), default=FEED_MODE,
-                    help="hand：人工递料（垫块定高，可到 8 层）；table：开机前预摆在桌面（≤5 层，全自动）")
+                    help="hand：人工递料（垫块定高，可到 10 层）；table：开机前预摆在桌面（≤5 层，全自动）")
     ap.add_argument("--supports", help="可用垫块高度列表（mm），如 0,30,60,90,120")
     ap.add_argument("--release-gap", type=float, help="放置时木块底面高出支撑面（mm）")
     ap.add_argument("--step", action="store_true", help="每次夹紧/松开前回车确认")
