@@ -22,7 +22,8 @@
    以上一点的解为种子保持肘部分支连续；越障横移若需切换构型，在高处用关节空间运动切换。
 3. 流式下发：所有轨迹按 50 Hz（20 ms）逐帧下发 16 字节控制帧，开合夹爪也按帧插值。
 4. 倾斜放置：桌面高度上每个半径只对应一段窄的可用俯仰。作业纸跨度约 200 mm，夹取点与落料点
-   的俯仰无法完全一致，放下时木块会带一个小倾角（推荐摆放下最大约 15°）。程序按手中木块的
+   的俯仰无法完全一致，放下时木块会带一个倾角（推荐摆放下 11°~21.5°）。所选俯仰对 ±5 mm
+   的径向摆放误差仍可达（鲁棒窗口），纸没摆准也不至于无解。程序按手中木块的
    实际姿态，把最低棱停在纸面上方 RELEASE_GAP 处再松爪：倾斜绕切向水平轴，着地的是整条棱，
    木块翻平时底面中心水平移动 < 1 mm。离线检查给出每趟倾角和“底面距圆边界”的余量。
 5. 安全：木块只在越障高度横移；中止（Ctrl+C）只停止下发、绝不松爪。
@@ -84,16 +85,22 @@ SETTLE_S = 0.4
 
 
 # ============================================================
-# 2. 作业纸与木块（作业纸尺寸按课件图估计，请按实物测量后修改）
+# 2. 作业纸与木块
 # ============================================================
+# 作业纸几何来自课件原图（479×692 px）的圆拟合（六个圆残差均 0.4 px）：
+#   列距 : 行距 : 圆直径 = 231.18 : 225.90 : 145.86 px —— 相对关系是精确的；
+#   绝对比例按纸宽 210 mm 换算（0.4384 mm/px）。原图长宽比 0.692 ≠ A4 的 0.707，说明截图有
+#   裁切，比例可能有约 ±2% 偏差：量一下 s1→s3 圆心距（约 198 mm）用 --s1s3 传入即可校准。
+FIG_COL_PX, FIG_ROW_PX, FIG_DIAM_PX = 231.18, 225.90, 145.86
+SHEET_MM_PER_PX = 210.0 / 479.0
 
 TABLE_Z = 52.0                   # 桌面（作业纸）在基座系中的高度（第六周标定）
 BLOCK_SIZE = 30.0                # 木块边长 h
 
-COL_PITCH = 100.0                # s 列与 t 列圆心距（mm）【估计值，请实测】
-ROW_PITCH = 100.0                # 相邻两行圆心距（mm）【估计值，请实测】
-CIRCLE_DIAMETER = 64.0           # 区域圆直径（mm）【估计值，请实测】
-SHEET_CENTER_XY = (245.0, 0.0)   # 作业纸中心（第 2 行两圆心连线中点）在基座系中的位置（--mode scan 推荐）
+COL_PITCH = FIG_COL_PX * SHEET_MM_PER_PX         # ≈ 101.4 mm：s 列与 t 列圆心距
+ROW_PITCH = FIG_ROW_PX * SHEET_MM_PER_PX         # ≈ 99.0 mm：相邻两行圆心距
+CIRCLE_DIAMETER = FIG_DIAM_PX * SHEET_MM_PER_PX  # ≈ 63.9 mm：区域圆直径
+SHEET_CENTER_XY = (257.5, 0.0)   # 作业纸中心（s2、t2 圆心连线中点）在基座系中的位置（--mode scan 推荐）
 SHEET_YAW_DEG = 0.0              # u 轴（s→t）相对 +X_B 的转角
 
 POINT_XY_OVERRIDE = {}           # 实测圆心：{"s1": (x, y), ...}；给出后覆盖上面的作业纸几何
@@ -108,7 +115,8 @@ RELEASE_GAP = 1.0                # 松爪时木块最低棱高出纸面的距离
 SLOW_ZONE = 5.0
 TRANSIT_CLEAR_HELD = 25.0        # 横移时手中木块底面高出最高木块顶面
 TRANSIT_CLEAR_EMPTY = 25.0       # 空爪横移时夹指最低点高出最高木块顶面
-MAX_PLACE_TILT_DEG = 18.0        # 允许的放置倾角（夹取与放置俯仰差）上限
+MAX_PLACE_TILT_DEG = 26.0        # 放置倾角上限：棱先着地、绕棱翻平，<45° 不会翻倒；留给纸转角/比例误差的余量
+POSITION_TOLERANCE = 5.0         # 取放点位置容差：所选俯仰对圆心沿半径 ±该值仍然可行（纸的摆放/标定误差）
 REGION_MARGIN = 2.0              # 规划时木块底面到圆边界至少留的余量（mm）
 
 # 速度
@@ -287,11 +295,26 @@ def block_center_at(xy):
 TILT_LIFT_ALLOW = 8.0            # 倾斜放置时夹取点比水平放置高出的余量（≈ h/2·sin(倾角)，18° 时约 4.6 mm）
 
 
-def point_window(xy):
-    """取放点的俯仰窗口：覆盖从夹取高度到悬停点的整段竖直行程（含倾斜放置时的抬高量）。"""
-    g = block_center_at(xy) + np.array([0.0, 0.0, GRASP_Z_OFFSET])
-    top = g + np.array([0.0, 0.0, RELEASE_GAP + TILT_LIFT_ALLOW + APPROACH + HOLD_SAG_COMP])
-    return pitch_window(g - np.array([0.0, 0.0, 1.0]), top)
+_WIN_CACHE = {}
+
+
+def point_window(xy, tol=None):
+    """取放点的俯仰窗口：覆盖从夹取高度到悬停点的整段竖直行程（含倾斜放置时的抬高量），
+    并且对圆心沿半径偏移 ±tol 仍然可行（取三处窗口的交集）。窗口只与半径有关。"""
+    tol = POSITION_TOLERANCE if tol is None else tol
+    r = float(np.hypot(xy[0], xy[1]))
+    lo, hi = -np.inf, np.inf
+    for dr in ((-tol, 0.0, tol) if tol > 0 else (0.0,)):
+        key = (round(r + dr, 2), GRASP_Z_OFFSET, RELEASE_GAP, APPROACH, HOLD_SAG_COMP)
+        if key not in _WIN_CACHE:
+            g = np.array([r + dr, 0.0, TABLE_Z + BLOCK_SIZE / 2 + GRASP_Z_OFFSET])
+            top = g + np.array([0.0, 0.0, RELEASE_GAP + TILT_LIFT_ALLOW + APPROACH + HOLD_SAG_COMP])
+            _WIN_CACHE[key] = pitch_window(g - np.array([0.0, 0.0, 1.0]), top)
+        w = _WIN_CACHE[key]
+        if w is None:
+            return None
+        lo, hi = max(lo, w[0]), min(hi, w[1])
+    return (lo, hi) if hi - lo >= 1.0 else None
 
 
 def choose_pitches(W_pick, W_place):
@@ -688,8 +711,11 @@ def held_corners(rel, q):
 
 
 def point_in_block(p, center, yaw, expand):
+    """连杆采样点（半径 expand 的球）与木块是否相交：按点到长方体的真实距离判断，
+    避免把木块各向外扩成方盒后在棱角处过度保守。"""
     d = rot_z(yaw).T @ (np.asarray(p) - center)
-    return bool(np.all(np.abs(d) <= BLOCK_SIZE / 2 + expand))
+    out = np.maximum(np.abs(d) - BLOCK_SIZE / 2, 0.0)
+    return bool(np.linalg.norm(out) <= expand)
 
 
 def obb_penetration(c1, R1, c2, R2, half=BLOCK_SIZE / 2):
@@ -1073,10 +1099,10 @@ def run_scan():
         print("当前摆放不可行：", e)
     if POINT_XY_OVERRIDE:
         return
-    print("\n搜索作业纸摆放（中心沿 +X_B，u 轴转角 0~175°），按最大倾角排序：")
+    print(f"\n搜索作业纸摆放（中心沿 +X_B，转角 -10~10°；位置容差 ±{POSITION_TOLERANCE:.0f} mm），按最大倾角排序：")
     rows = []
-    for R in np.arange(180.0, 320.0, 5.0):
-        for yaw in np.arange(0.0, 180.0, 5.0):
+    for R in np.arange(190.0, 300.1, 2.5):
+        for yaw in np.arange(-10.0, 10.1, 2.5):
             p = sheet_points((R, 0.0), yaw)
             try:
                 trs, W = plan_transfers(2, p)
@@ -1087,7 +1113,9 @@ def run_scan():
             rows.append((round(worst, 1), -narrow, R, yaw))
     rows.sort()
     for worst, nn, R, yaw in rows[:8]:
-        print(f"  中心 ({R:.0f}, 0)  u 轴转角 {yaw:.0f}°  最大倾角 {worst:.1f}°  最窄俯仰窗口 {-nn:.1f}°")
+        print(f"  中心 ({R:.1f}, 0)  u 轴转角 {yaw:+.1f}°  最大倾角 {worst:.1f}°  最窄俯仰窗口 {-nn:.1f}°")
+    print("\n摆放方法：作业纸 s 列靠近机械臂、t 列远离，s1/t1 在左侧（站在机械臂身后看）。"
+          "先用 --mode calib 让夹爪停在 s2、t2 圆心上方，移动纸使两个圆心正对两指中间。")
 
 
 # ============================================================
@@ -1096,13 +1124,16 @@ def run_scan():
 
 def main():
     global SHEET_CENTER_XY, SHEET_YAW_DEG, COL_PITCH, ROW_PITCH, CIRCLE_DIAMETER, GRIP_CLOSE_DEG, RELEASE_GAP
+    global POSITION_TOLERANCE
     ap = argparse.ArgumentParser(description="第八周：机械臂定点搬运（必做 + 选做）")
     ap.add_argument("--mode", choices=("plan", "simulate", "hardware", "calib", "scan"), default="plan")
     ap.add_argument("--task", type=int, choices=(1, 2), default=1, help="1：必做；2：必做后接着做选做")
     ap.add_argument("--port", default=SERIAL_PORT)
     ap.add_argument("--sheet", type=float, nargs=2, metavar=("X", "Y"), help="作业纸中心（基座系 mm）")
     ap.add_argument("--sheet-yaw", type=float, help="作业纸 u 轴（s→t）转角（deg）")
+    ap.add_argument("--s1s3", type=float, help="实测 s1→s3 圆心距（mm），按原图比例校准整张作业纸")
     ap.add_argument("--pitch", type=float, nargs=2, metavar=("COL", "ROW"), help="实测列距、行距（mm）")
+    ap.add_argument("--tol", type=float, help="取放点位置容差（mm），默认 5")
     ap.add_argument("--circle", type=float, help="实测区域圆直径（mm）")
     ap.add_argument("--grip-close", type=float, help="夹爪闭合角（deg）")
     ap.add_argument("--release-gap", type=float, help="松爪时木块最低棱离纸面（mm）")
@@ -1115,8 +1146,13 @@ def main():
         SHEET_CENTER_XY = tuple(args.sheet)
     if args.sheet_yaw is not None:
         SHEET_YAW_DEG = args.sheet_yaw
+    if args.s1s3:
+        k = args.s1s3 / (2.0 * FIG_ROW_PX)
+        COL_PITCH, ROW_PITCH, CIRCLE_DIAMETER = FIG_COL_PX * k, FIG_ROW_PX * k, FIG_DIAM_PX * k
     if args.pitch:
         COL_PITCH, ROW_PITCH = args.pitch
+    if args.tol is not None:
+        POSITION_TOLERANCE = args.tol
     if args.circle:
         CIRCLE_DIAMETER = args.circle
     if args.grip_close is not None:
@@ -1132,9 +1168,9 @@ def main():
         pl = Planner(1)
         pl.blocks = {}                     # 标定时纸上不放木块
         pts = pl.points
-        pl.start_from_zero(pts["s1"])
+        pl.start_from_zero(pts["s2"])
         stops = []
-        for k in POINT_NAMES:
+        for k in ("s2", "t2", "s1", "t1", "s3", "t3"):     # 先 s2、t2 定位置与方向，再核对其余四点
             hover = np.array([pts[k][0], pts[k][1], TABLE_Z + BLOCK_SIZE + 20.0])
             pl.travel_to_hover(f"标定/{k}", hover, best_pitch(hover), target=None)
             stops.append((k, len(pl.segments)))
@@ -1150,7 +1186,9 @@ def main():
                 for seg in pl.segments[start:end]:
                     stream(ser, seg.q)
                 start = end
-                input(f"  已停在 {k} 上方：核对夹爪中心与圆心的偏差（写入 PICK/PLACE_XY_COMP 或修正作业纸位置），回车继续")
+                tip = ("移动作业纸，使该圆心正对两指中间" if k in ("s2", "t2")
+                       else "核对偏差（>3 mm 时写入 PICK/PLACE_XY_COMP 或微调纸的转角）")
+                input(f"  已停在 {k} 上方：{tip}，回车继续")
             for seg in pl.segments[start:]:
                 stream(ser, seg.q)
         finally:
