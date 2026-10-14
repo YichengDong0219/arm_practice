@@ -1577,7 +1577,8 @@ def run_calib(port, only=None, path=CALIB_FILE, use_keyboard=True):
                     d = cur - guess
                     tail = "  [已升起，目标]" if up else f"  z={zz:6.1f}  俯仰={pp:6.1f}°"
                     print(f"\r  [{k}|{MODE_NAMES[mode]}] x={cur[0]:7.1f}  y={cur[1]:7.1f}  相对估计 ({d[0]:+5.1f}, "
-                          f"{d[1]:+5.1f}){tail}  {'慢' if shift else '常'}速   ", end="", flush=True)
+                          f"{d[1]:+5.1f}){tail}  J1~J4=({q[0]:+5.1f},{q[1]:+5.1f},{q[2]:+5.1f},{q[3]:+5.1f})  "
+                          f"{'慢' if shift else '常'}速   ", end="", flush=True)
                     last_print = now
                 tick += SEND_PERIOD_S
                 rem = tick - time.perf_counter()
