@@ -22,7 +22,7 @@
    以上一点的解为种子保持肘部分支连续；越障横移若需切换构型，在高处用关节空间运动切换。
 3. 流式下发：所有轨迹按 50 Hz（20 ms）逐帧下发 16 字节控制帧，开合夹爪也按帧插值。
 4. 倾斜放置：桌面高度上每个半径只对应一段窄的可用俯仰。作业纸跨度约 200 mm，夹取点与落料点
-   的俯仰无法完全一致，放下时木块会带一个倾角（推荐摆放下 11°~21.5°）。所选俯仰对 ±5 mm
+   的俯仰无法完全一致，放下时木块会带一个倾角（推荐摆放下 10.5°~20.5°）。所选俯仰对 ±5 mm
    的径向摆放误差仍可达（鲁棒窗口），纸没摆准也不至于无解。程序按手中木块的
    实际姿态，把最低棱停在纸面上方 RELEASE_GAP 处再松爪：倾斜绕切向水平轴，着地的是整条棱，
    木块翻平时底面中心水平移动 < 1 mm。离线检查给出每趟倾角和“底面距圆边界”的余量。
@@ -87,20 +87,25 @@ SETTLE_S = 0.4
 # ============================================================
 # 2. 作业纸与木块
 # ============================================================
-# 作业纸几何来自课件原图（479×692 px）的圆拟合（六个圆残差均 0.4 px）：
-#   列距 : 行距 : 圆直径 = 231.18 : 225.90 : 145.86 px —— 相对关系是精确的；
-#   绝对比例按纸宽 210 mm 换算（0.4384 mm/px）。原图长宽比 0.692 ≠ A4 的 0.707，说明截图有
-#   裁切，比例可能有约 ±2% 偏差：量一下 s1→s3 圆心距（约 198 mm）用 --s1s3 传入即可校准。
-FIG_COL_PX, FIG_ROW_PX, FIG_DIAM_PX = 231.18, 225.90, 145.86
-SHEET_MM_PER_PX = 210.0 / 479.0
+# 作业纸几何来自实物 A4 纸扫描（1855×2683 px）：先拟合纸的四条边，按 210×297 mm 做单应变换，
+# 再对六个圆做最小二乘圆拟合（每圆 4000+ 个边缘点，残差 0.2~0.3 mm），最后拟合一个正交网格：
+#   s 列 → t 列 97.3 mm；第 2 行 → 第 1 行 95.5 mm，第 2 行 → 第 3 行 93.8 mm（两行间距确实不等）；
+#   圆直径 61.0~61.6 mm；图案相对纸边转了约 0.4°（打印歪斜），六个圆心对网格的残差 ≤ 0.3 mm。
+# 下面是以 s2、t2 连线中点为原点、u 轴 s→t、v 轴指向第 1 行的局部坐标（mm）。
+# 手机测距仪交叉核对（整厘米读数）：纸左边→s1 5、s1→t1 10、t1→纸右边 6、纸上边→t1 4、
+#   行距 9 / 9、t3→纸下边 7 cm，与扫描值在 1 cm 读数精度内一致。
+# 扫描比例由纸边推得，误差约 ±1%：用钢尺量一下 s1→s3 圆心距（约 189.2 mm）用 --s1s3 传入即可校准。
+SHEET_UV = {"s1": (-48.65, 95.49), "s2": (-48.65, 0.0), "s3": (-48.65, -93.75),
+            "t1": (48.65, 95.49), "t2": (48.65, 0.0), "t3": (48.65, -93.75)}
+SHEET_S1S3 = SHEET_UV["s1"][1] - SHEET_UV["s3"][1]   # 189.24 mm
+SHEET_SCALE_U = 1.0              # --s1s3 / --pitch 校准后的缩放
+SHEET_SCALE_V = 1.0
 
 TABLE_Z = 52.0                   # 桌面（作业纸）在基座系中的高度（第六周标定）
 BLOCK_SIZE = 30.0                # 木块边长 h
 
-COL_PITCH = FIG_COL_PX * SHEET_MM_PER_PX         # ≈ 101.4 mm：s 列与 t 列圆心距
-ROW_PITCH = FIG_ROW_PX * SHEET_MM_PER_PX         # ≈ 99.0 mm：相邻两行圆心距
-CIRCLE_DIAMETER = FIG_DIAM_PX * SHEET_MM_PER_PX  # ≈ 63.9 mm：区域圆直径
-SHEET_CENTER_XY = (257.5, 0.0)   # 作业纸中心（s2、t2 圆心连线中点）在基座系中的位置（--mode scan 推荐）
+CIRCLE_DIAMETER = 61.0           # 区域圆直径（扫描最小值，偏保守）
+SHEET_CENTER_XY = (260.0, 0.0)   # 作业纸中心（s2、t2 圆心连线中点）在基座系中的位置（--mode scan：俯仰窗口最宽的摆放）
 SHEET_YAW_DEG = 0.0              # u 轴（s→t）相对 +X_B 的转角
 
 POINT_XY_OVERRIDE = {}           # 实测圆心：{"s1": (x, y), ...}；给出后覆盖上面的作业纸几何
@@ -283,9 +288,16 @@ def sheet_points(center_xy=None, yaw_deg=None):
     yaw = np.deg2rad(SHEET_YAW_DEG if yaw_deg is None else yaw_deg)
     u_axis = np.array([np.cos(yaw), np.sin(yaw)])
     v_axis = np.array([-np.sin(yaw), np.cos(yaw)])
-    uv = {"s1": (-COL_PITCH / 2, ROW_PITCH), "s2": (-COL_PITCH / 2, 0.0), "s3": (-COL_PITCH / 2, -ROW_PITCH),
-          "t1": (COL_PITCH / 2, ROW_PITCH), "t2": (COL_PITCH / 2, 0.0), "t3": (COL_PITCH / 2, -ROW_PITCH)}
-    return {k: np.array([cx, cy]) + u * u_axis + v * v_axis for k, (u, v) in uv.items()}
+    return {k: np.array([cx, cy]) + u * SHEET_SCALE_U * u_axis + v * SHEET_SCALE_V * v_axis
+            for k, (u, v) in SHEET_UV.items()}
+
+
+def col_pitch():
+    return (SHEET_UV["t2"][0] - SHEET_UV["s2"][0]) * SHEET_SCALE_U
+
+
+def row_pitches():
+    return (SHEET_UV["s1"][1] * SHEET_SCALE_V, -SHEET_UV["s3"][1] * SHEET_SCALE_V)
 
 
 def block_center_at(xy):
@@ -853,8 +865,8 @@ def describe_layout(points):
 
 def summarize(pl):
     L = [f"\n========== 第八周 定点搬运（任务 {'必做' if pl.task == 1 else '必做 + 选做'}） =========="]
-    L.append(f"作业纸：中心 {SHEET_CENTER_XY}，u 轴转角 {SHEET_YAW_DEG:.0f}°，列距 {COL_PITCH:.0f}、行距 {ROW_PITCH:.0f}、"
-             f"圆直径 {CIRCLE_DIAMETER:.0f} mm；桌面 z={TABLE_Z}")
+    L.append(f"作业纸：中心 {SHEET_CENTER_XY}，u 轴转角 {SHEET_YAW_DEG:.0f}°，列距 {col_pitch():.1f}、行距 {row_pitches()[0]:.1f}/{row_pitches()[1]:.1f}、"
+             f"圆直径 {CIRCLE_DIAMETER:.1f} mm；桌面 z={TABLE_Z}")
     L.append("圆心位置（基座系）：\n" + describe_layout(pl.points))
     L.append("每趟搬运（夹取俯仰 → 放置俯仰，差值即放下时木块倾角）：")
     for tr, pc in zip(pl.transfers, pl.placements):
@@ -895,8 +907,8 @@ def export(pl, out_dir, tag):
                 t += SEND_PERIOD_S
     summary = {
         "task": pl.task, "points": {k: v.round(2).tolist() for k, v in pl.points.items()},
-        "sheet": {"center": SHEET_CENTER_XY, "yaw_deg": SHEET_YAW_DEG, "col_pitch": COL_PITCH,
-                  "row_pitch": ROW_PITCH, "circle_diameter": CIRCLE_DIAMETER},
+        "sheet": {"center": SHEET_CENTER_XY, "yaw_deg": SHEET_YAW_DEG, "col_pitch": col_pitch(),
+                  "row_pitch_12_23": row_pitches(), "points_uv": {k: [u * SHEET_SCALE_U, v * SHEET_SCALE_V] for k, (u, v) in SHEET_UV.items()}, "circle_diameter": CIRCLE_DIAMETER},
         "transfers": [{k: v for k, v in tr.items()} for tr in pl.transfers],
         "duration_s": sum(s.duration for s in pl.segments),
         "checks": pl.checks,
@@ -1123,7 +1135,7 @@ def run_scan():
 # ============================================================
 
 def main():
-    global SHEET_CENTER_XY, SHEET_YAW_DEG, COL_PITCH, ROW_PITCH, CIRCLE_DIAMETER, GRIP_CLOSE_DEG, RELEASE_GAP
+    global SHEET_CENTER_XY, SHEET_YAW_DEG, SHEET_SCALE_U, SHEET_SCALE_V, CIRCLE_DIAMETER, GRIP_CLOSE_DEG, RELEASE_GAP
     global POSITION_TOLERANCE
     ap = argparse.ArgumentParser(description="第八周：机械臂定点搬运（必做 + 选做）")
     ap.add_argument("--mode", choices=("plan", "simulate", "hardware", "calib", "scan"), default="plan")
@@ -1131,8 +1143,8 @@ def main():
     ap.add_argument("--port", default=SERIAL_PORT)
     ap.add_argument("--sheet", type=float, nargs=2, metavar=("X", "Y"), help="作业纸中心（基座系 mm）")
     ap.add_argument("--sheet-yaw", type=float, help="作业纸 u 轴（s→t）转角（deg）")
-    ap.add_argument("--s1s3", type=float, help="实测 s1→s3 圆心距（mm），按原图比例校准整张作业纸")
-    ap.add_argument("--pitch", type=float, nargs=2, metavar=("COL", "ROW"), help="实测列距、行距（mm）")
+    ap.add_argument("--s1s3", type=float, help="实测 s1→s3 圆心距（mm，扫描值 189.2），等比校准整张作业纸")
+    ap.add_argument("--pitch", type=float, nargs=2, metavar=("COL", "ROW"), help="实测 s→t 列距、s1→s3 距离（mm），两方向分别校准")
     ap.add_argument("--tol", type=float, help="取放点位置容差（mm），默认 5")
     ap.add_argument("--circle", type=float, help="实测区域圆直径（mm）")
     ap.add_argument("--grip-close", type=float, help="夹爪闭合角（deg）")
@@ -1147,10 +1159,11 @@ def main():
     if args.sheet_yaw is not None:
         SHEET_YAW_DEG = args.sheet_yaw
     if args.s1s3:
-        k = args.s1s3 / (2.0 * FIG_ROW_PX)
-        COL_PITCH, ROW_PITCH, CIRCLE_DIAMETER = FIG_COL_PX * k, FIG_ROW_PX * k, FIG_DIAM_PX * k
+        SHEET_SCALE_U = SHEET_SCALE_V = args.s1s3 / SHEET_S1S3
+        CIRCLE_DIAMETER *= SHEET_SCALE_V
     if args.pitch:
-        COL_PITCH, ROW_PITCH = args.pitch
+        SHEET_SCALE_U = args.pitch[0] / (SHEET_UV["t2"][0] - SHEET_UV["s2"][0])
+        SHEET_SCALE_V = args.pitch[1] / SHEET_S1S3
     if args.tol is not None:
         POSITION_TOLERANCE = args.tol
     if args.circle:
