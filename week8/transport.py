@@ -280,6 +280,25 @@ def solve_ik(p, pitch, q_prev=None, margin=None):
     return min(valid, key=lambda q: float(np.sum((q[:4] - q_prev[:4]) ** 2)))
 
 
+FLEX_PITCH_GRID = np.arange(-90.0, 30.01, 0.25)
+
+
+def solve_ik_flex(p, pitch, q_prev=None):
+    """优先按给定俯仰求逆解；无解时就近换俯仰（不要求前后夹爪角度一致），先保留余量、再贴限位。"""
+    try:
+        return solve_ik(p, pitch, q_prev)
+    except IKError:
+        pass
+    for margin in (_m(), 0.0):
+        for x in sorted(FLEX_PITCH_GRID, key=lambda v: abs(v - pitch)):
+            valid = [q for q in ik_candidates(p, x) if joint_margin(q) >= margin]
+            if valid:
+                if q_prev is None:
+                    return max(valid, key=joint_margin)
+                return min(valid, key=lambda q: float(np.sum((q[:4] - q_prev[:4]) ** 2)))
+    raise IKError(f"点 {np.round(p, 1)} mm 在任何俯仰下都没有限位内逆解（超出机械臂可达范围）")
+
+
 def pitch_window(p_low, p_high, margin=None):
     """在 p_low→p_high 的竖直段上全程可行的俯仰区间（可能为空）。"""
     margin = WINDOW_MARGIN_DEG if margin is None else margin
@@ -380,7 +399,7 @@ FALLBACK_POINTS = set()
 def plan_transfers(task, points=None, fallback=None):
     global JOINT_MARGIN_DEG
     points = sheet_points() if points is None else points
-    fallback = bool(POINT_XY_OVERRIDE) if fallback is None else fallback
+    fallback = True if fallback is None else fallback
     windows = {k: point_window(v) for k, v in points.items()}
     for k, w in list(windows.items()):
         if w is None and fallback:
@@ -442,9 +461,10 @@ def line_points(p0, p1, pitch0, pitch1, q_start, duration):
     pitches = (1 - s) * pitch0 + s * pitch1
     qs, q = [], q_start
     for p, pt in zip(pts, pitches):
-        q = solve_ik(p, pt, q)
+        q = solve_ik_flex(p, pt, q)
         qs.append(q)
-    return np.array(qs), pts, pitches
+    qs = np.array(qs)
+    return qs, pts, np.array([tool_pitch(x) for x in qs])
 
 
 def const_pitch_top(p_low, pitch, z_max, step=2.0, margin=None):
@@ -608,10 +628,25 @@ class Planner:
                 if tried >= 30:
                     break
         if not ok and not self._transit_movej(label, here, pitch_here, up_c, z_up_c, up, zt,
-                                              above, hover, hover_pitch, target):
+                                              above, hover, hover_pitch, target) \
+                and not self._transit_free(label, up, above, hover, hover_pitch, target):
             raise IKError(f"{label}: 找不到可行的越障路线（越障高度 {zt:.0f} mm）"
                           + (f"；{last_err}" if last_err else ""))
         self.under = target
+
+    def _transit_free(self, label, up, above, hover, hover_pitch, target):
+        """最后的越障方案：不要求俯仰一致——升到越障高度（俯仰随逆解就近变化）→ 关节空间移到目标上方 →
+        降到悬停点（俯仰逐渐过渡到取放俯仰）。"""
+        saved = (len(self.segments), self.q.copy(), self.grip, self.under)
+        try:
+            self.line(f"{label}/上升", up, tool_pitch(self.q), VERTICAL_SPEED, target=self.under)
+            self.movej(f"{label}/高处关节移动", solve_ik_flex(above, hover_pitch, self.q))
+            self.line(f"{label}/下降", hover, hover_pitch, VERTICAL_SPEED, target=target)
+            return True
+        except IKError:
+            del self.segments[saved[0]:]
+            self.q, self.grip, self.under = saved[1].copy(), saved[2], saved[3]
+            return False
 
     def _transit_movej(self, label, here, pitch_here, up_c, z_up_c, up, zt, above, hover, hover_pitch, target):
         """备选越障：竖直升到越障高度 → 高处关节空间运动（可切换肘部构型）→ 竖直下降。"""
@@ -666,7 +701,7 @@ class Planner:
         g = np.array([target_xy[0], target_xy[1], TABLE_Z + BLOCK_SIZE / 2 + RELEASE_GAP + 5.0])
         q = self.q
         for _ in range(4):
-            q = solve_ik(g, pitch, q)
+            q = solve_ik_flex(g, pitch, q)
             Tb = tool_pose(q) @ self.held_rel[name]
             local = np.array([[sx, sy, sz] for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)]) * BLOCK_SIZE / 2
             corners = (Tb[:3, :3] @ local.T).T + Tb[:3, 3]
@@ -741,7 +776,11 @@ class Planner:
     def start_from_zero(self, first_xy):
         self.state = "READY"
         p = np.array([first_xy[0], first_xy[1], self.transit_z()])
-        self.movej("零位→准备", solve_ik(p, best_pitch(p)))
+        try:
+            pt = best_pitch(p)
+        except IKError:
+            pt = -45.0
+        self.movej("零位→准备", solve_ik_flex(p, pt))
 
     # ---------- 任务 ----------
     def run(self):
@@ -949,7 +988,8 @@ def summarize(pl):
     L.append(f"夹指离纸面最低 {c['min_finger_table']:.1f} mm；横移时手中木块与其他木块最小间隙 "
              f"{c['min_held_gap']:.1f} mm（0 为起吊/落下贴合）")
     if FALLBACK_POINTS:
-        L.append(f"兜底点 {sorted(FALLBACK_POINTS)}：按标定姿态的俯仰夹取/放置，已取消关节余量")
+        L.append(f"兜底点 {sorted(FALLBACK_POINTS)}：常规俯仰窗口为空，改用夹取高度可达的俯仰（有标定时用标定俯仰），"
+                 "进出时俯仰随逆解就近变化；已取消关节余量")
     L.append("离线检查：" + ("通过" if not c["issues"] else f"{len(c['issues'])} 项提示（不阻止实机运行）"))
     return "\n".join(L)
 
@@ -1524,12 +1564,9 @@ def run_calib(port, only=None, path=CALIB_FILE, use_keyboard=True):
                             z_new = (g[2] + dt * v_lin * vz) if mode == "free" else zg
                             pt_new = (tool_pitch(q) + dt * v_ang * vp) if mode == "free" else pitch
                             try:
-                                send(solve_ik(np.array([nxt[0], nxt[1], z_new]), pt_new, q, margin=0.0))
+                                send(solve_ik_flex(np.array([nxt[0], nxt[1], z_new]), pt_new, q))
                             except IKError:
-                                if mode == "grasp":
-                                    note("固定夹取姿态到不了这里：按 M 切到自由末端 / 关节模式继续")
-                                else:
-                                    note("末端逆解无解：按 M 切到关节模式直接转关节")
+                                note("这里任何俯仰都够不到（超出可达范围）：按 M 切到关节模式直接转关节")
                 now = time.perf_counter()
                 if now - last_print > 0.2:
                     if up:
@@ -1647,7 +1684,7 @@ def run_calib(port, only=None, path=CALIB_FILE, use_keyboard=True):
             z_new = g[2] + dz if mode != "grasp" else zg
             p_new = tool_pitch(pl.q) + dp if mode != "grasp" else pitch
             try:
-                qn = solve_ik(np.array([g[0] + delta[0], g[1] + delta[1], z_new]), p_new, pl.q, margin=0.0)
+                qn = solve_ik_flex(np.array([g[0] + delta[0], g[1] + delta[1], z_new]), p_new, pl.q)
             except IKError as e:
                 print(f"    末端逆解无解（{e}）：可用 j1+2 等指令直接转关节")
                 continue
@@ -1702,7 +1739,7 @@ def run_scan():
         W = point_window(pts[k])
         print(f"  {k}: r={np.hypot(*pts[k]):.0f} mm  窗口 {W}")
     try:
-        trs, _ = plan_transfers(2, pts)
+        trs, _ = plan_transfers(2, pts, fallback=False)
         print("每趟倾角：" + "，".join(f"{t['from']}→{t['to']} {t['tilt']:+.1f}°" for t in trs))
     except IKError as e:
         print("当前摆放不可行：", e)
@@ -1714,7 +1751,7 @@ def run_scan():
         for yaw in np.arange(-10.0, 10.1, 2.5):
             p = sheet_points((R, 0.0), yaw)
             try:
-                trs, W = plan_transfers(2, p)
+                trs, W = plan_transfers(2, p, fallback=False)
             except IKError:
                 continue
             worst = max(abs(t["tilt"]) for t in trs)
