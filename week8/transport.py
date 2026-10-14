@@ -10,8 +10,9 @@
     python week8/transport.py --mode scan                       # 各点俯仰窗口、每趟倾角、推荐作业纸摆放
     python week8/transport.py --mode plan --task 1              # 规划+离线检查，导出 CSV/JSON/PNG
     python week8/transport.py --mode simulate --task 2          # 三维动画（必做后接选做）
-    python week8/transport.py --mode calib --port COM5          # 实机：逐点微调夹爪对准 6 个圆心并记录
+    python week8/transport.py --mode calib --port COM5          # 实机：键盘（同 teleop 按键）把夹爪移到 6 个圆心并记录 x、y
     python week8/transport.py --mode calib --port COM5 --only t3   # 只重标某几个点
+    python week8/transport.py --mode calib --port COM5 --text-jog  # 非 Windows：输入指令微调
     python week8/transport.py --mode hardware --task 1 --port COM5 [--step]
     python week8/transport.py --mode hardware --task 2 --port COM5        # 必做 + 选做连续执行
 
@@ -28,8 +29,10 @@
    实际姿态，把最低棱停在纸面上方 RELEASE_GAP 处再松爪：倾斜绕切向水平轴，着地的是整条棱，
    木块翻平时底面中心水平移动 < 1 mm。离线检查给出每趟倾角和“底面距圆边界”的余量。
 5. 安全：木块只在越障高度横移；中止（Ctrl+C）只停止下发、绝不松爪。
-6. 圆心标定（--mode calib）：夹爪以实际夹取姿态停在各圆心估计位置，键盘微调到两指中点对准圆心后记录，
-   存入 week8/sheet_calib.json；plan / simulate / hardware 自动读取。标定后纸不能再动。
+6. 圆心标定（--mode calib）：夹爪以实际夹取姿态停在各圆心估计位置，用 teleop 同款实时键盘
+   （W/S 径向、A/D 绕底座，按住移动）微调到两指中点对准圆心后回车记录，存入 week8/sheet_calib.json；
+   plan / simulate / hardware 自动读取这套 x、y，高度固定按桌面 TABLE_Z。标定后纸不能再动。
+   注意：teleop 显示的 r、z 用的是旧的简化连杆长度，与这里的实测 D-H 不同，不能直接抄过来。
 
 坐标系与 week5~week7 的 D-H 模型一致（基座系，mm），桌面 z = TABLE_Z。
 作业纸坐标：u 轴由 s 列指向 t 列，v 轴由第 3 行指向第 1 行；默认 u = +X_B（远离机械臂），
@@ -1193,7 +1196,44 @@ def save_calib(path, nominal, measured, pitches):
         print(ln)
 
 
-def run_calib(port, only=None, path=CALIB_FILE):
+# ---------- 实时键盘（复用 teleop/keyboard_position_ik.py 的按键读取，仅 Windows） ----------
+KEY_HELP = """  W / S（↑/↓）：径向前进 / 后退        A / D（←/→）：绕底座右转 / 左转（与 teleop 相同）
+  按住移动，默认 {fast:g} mm/s；同时按住 Shift 为 {slow:g} mm/s 微调
+  O / C ：张开 / 夹紧（试夹）            Q / E ：升到安全高度（放、取试夹木块）/ 降回夹取高度
+  R     ：回到本点初始估计               Enter：记录本点，去下一个点
+  Backspace：跳过本点                    Esc  ：保存已记录的点并回零退出"""
+VK = {"ESC": 0x1B, "ENTER": 0x0D, "BACK": 0x08, "SHIFT": 0x10, "W": ord("W"), "A": ord("A"), "S": ord("S"),
+      "D": ord("D"), "Q": ord("Q"), "E": ord("E"), "O": ord("O"), "C": ord("C"), "R": ord("R"),
+      "LEFT": 0x25, "UP": 0x26, "RIGHT": 0x27, "DOWN": 0x28}
+JOG_FAST = 10.0                  # mm/s
+JOG_SLOW = 2.0
+JOG_LIMIT = 15.0                 # 离估计位置的最大微调距离（mm）
+
+
+def _load_teleop_keys():
+    """导入仓库里 teleop 的按键函数（GetAsyncKeyState）；非 Windows 或缺依赖时返回 None。"""
+    import sys
+    root = Path(__file__).resolve().parents[1]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    try:
+        from teleop import keyboard_position_ik as kb
+        return kb
+    except Exception:
+        return None
+
+
+def _flush_console_input():
+    """实时按键期间按下的字母会进入控制台输入缓冲，下一次 input() 前清掉。"""
+    try:
+        import msvcrt
+        while msvcrt.kbhit():
+            msvcrt.getwch()
+    except Exception:
+        pass
+
+
+def run_calib(port, only=None, path=CALIB_FILE, use_keyboard=True):
     nominal = sheet_points(SHEET_CENTER_XY, SHEET_YAW_DEG)          # 名义几何（不读已有标定）
     measured = {}
     if only and Path(path).exists():
@@ -1204,16 +1244,21 @@ def run_calib(port, only=None, path=CALIB_FILE):
     pitches = point_pitches(guess0)
     zg = TABLE_Z + BLOCK_SIZE / 2 + GRASP_Z_OFFSET
 
+    kb = _load_teleop_keys() if use_keyboard else None
+    if use_keyboard and kb is None:
+        print("（未能加载 teleop 实时键盘：非 Windows 或缺少依赖，改用输入指令方式）")
+
     pl = Planner(1, guess0)
     pl.occupant = {}
     # 标定时纸上可能放着一块试夹用的木块：越障高度按“任意圆内有一块木块”计算
     pl.blocks = {"标定块": (block_center_at(guess0["s2"]), 0.0)}
 
-    print("手动标定圆心：夹爪以实际夹取时的姿态停在每个圆心的估计位置（指尖离纸约 5 mm），")
-    print("用键盘把两指中点对准圆心后输入 ok 记录。纸先用胶带固定，标定后不要再动。")
-    print("对准方法：① 从正上方看两指尖连线中点是否落在圆心；② 更准：up 升起后在圆内居中放一块木块")
-    print("（一个面正对机械臂底座，四边到圆的距离相等），down 降下后 c 试夹，看木块被推向哪边再微调。")
-    print(CALIB_HELP)
+    print("手动标定圆心：夹爪以实际夹取时的姿态（固定俯仰、夹取高度 z = "
+          f"{zg:.1f} mm，指尖离纸约 5 mm）停在每个圆心的估计位置，")
+    print("把两指中点移到圆心正上方后记录。记录的是 x、y；运行时高度固定按桌面 TABLE_Z 计算。")
+    print("纸先用胶带固定，标定后不要再动。更准的对法：升起后在圆内居中放一块木块（一个面正对底座），")
+    print("降下后夹紧，看木块被推向哪边，就把夹爪往那边移。")
+    print(KEY_HELP.format(fast=JOG_FAST, slow=JOG_SLOW) if kb else CALIB_HELP)
     print("顺序：" + " → ".join(order))
     if input("确认纸上没有木块、撤手后输入 YES 开始：").strip().upper() != "YES":
         return
@@ -1234,7 +1279,7 @@ def run_calib(port, only=None, path=CALIB_FILE):
         except IKError as e:
             del pl.segments[n0:]
             pl.q, pl.grip, pl.under = q0, g0, u0
-            print(f"    不可达：{e}")
+            print(f"\n    不可达：{e}")
             return False
 
     def go_aim(xy, pitch, label):
@@ -1243,7 +1288,208 @@ def run_calib(port, only=None, path=CALIB_FILE):
             pl.vertical(f"{label}/下降", zg, VERTICAL_SPEED)
         return safe(_do)
 
-    quit_all = False
+    def sync_jog(q5):
+        """把实时微调到达的姿态记入规划器（已经下发过，不再重复下发）。"""
+        q = add_grip_col(np.vstack([pl.q, q5]), pl.grip)
+        pl._push(Segment("标定/键盘微调", "jog", q, SEND_PERIOD_S))
+        sent[0] = len(pl.segments)
+
+    # ---------- 每个点的微调：实时键盘 ----------
+    def jog_keys(k, guess, pitch):
+        down = kb.key_down
+        while any(down(v) for v in VK.values()):
+            time.sleep(0.01)
+        up, aim_xy = False, grip_point(pl.q)[:2].copy()
+        q = pl.q.copy()
+        xy = grip_point(q)[:2].copy()
+        last_print = last_err = 0.0
+        tick = time.perf_counter()
+
+        def blocking(fn, *a):
+            nonlocal q, xy
+            if not np.allclose(q, pl.q):
+                sync_jog(q)
+            ok = fn(*a)
+            q = pl.q.copy()
+            xy = grip_point(q)[:2].copy()
+            return ok
+
+        def wait_release(*names):
+            for n in names:
+                while down(VK[n]):
+                    time.sleep(0.01)
+
+        try:
+            while True:
+                if down(VK["ESC"]):
+                    wait_release("ESC")
+                    return "quit", None
+                if down(VK["ENTER"]):
+                    wait_release("ENTER")
+                    return "ok", (aim_xy.copy() if up else xy.copy())
+                if down(VK["BACK"]):
+                    wait_release("BACK")
+                    return "skip", None
+                if down(VK["O"]) or down(VK["C"]):
+                    close = down(VK["C"])
+                    wait_release("O", "C")
+                    if up:
+                        print("\n    先按 E 降到夹取高度再试夹")
+                    else:
+                        blocking(safe, pl.gripper, "标定/试夹" if close else "标定/张开",
+                                 GRIP_CLOSE_DEG if close else GRIP_OPEN_DEG)
+                    tick = time.perf_counter()
+                    continue
+                if down(VK["Q"]):
+                    wait_release("Q")
+                    if not up:
+                        aim_xy = xy.copy()
+                        if pl.grip != GRIP_OPEN_DEG:
+                            blocking(safe, pl.gripper, "标定/张开", GRIP_OPEN_DEG)
+                        up = blocking(safe, pl.rise, "标定/升起")
+                        if up:
+                            print("\n    已升起：可在圆内放 / 取木块；W/S/A/D 只改目标位置，按 E 降下")
+                    tick = time.perf_counter()
+                    continue
+                if down(VK["E"]):
+                    wait_release("E")
+                    if up and blocking(go_aim, aim_xy, pitch, f"标定/{k}"):
+                        up = False
+                    tick = time.perf_counter()
+                    continue
+                if down(VK["R"]):
+                    wait_release("R")
+                    if up:
+                        aim_xy = guess.copy()
+                    else:
+                        blocking(safe, pl.line, "标定/回估计", np.array([guess[0], guess[1], zg]), pitch, SLOW_SPEED * 2)
+                    tick = time.perf_counter()
+                    continue
+
+                # 按住移动：径向 W/S，绕底座 A/D（A 右转 / 顺时针，D 左转 / 逆时针，与 teleop 一致）
+                vr = float(down(VK["W"]) or down(VK["UP"])) - float(down(VK["S"]) or down(VK["DOWN"]))
+                vt = float(down(VK["D"]) or down(VK["RIGHT"])) - float(down(VK["A"]) or down(VK["LEFT"]))
+                speed = JOG_SLOW if down(VK["SHIFT"]) else JOG_FAST
+                if vr or vt:
+                    cur = aim_xy if up else xy
+                    r = float(np.hypot(*cur))
+                    er = cur / r
+                    et = np.array([-er[1], er[0]])
+                    v = np.array([vr, vt]) / max(1.0, float(np.hypot(vr, vt)))
+                    nxt = cur + SEND_PERIOD_S * speed * (v[0] * er + v[1] * et)
+                    if np.linalg.norm(nxt - guess) > JOG_LIMIT:
+                        nxt = cur
+                        now = time.perf_counter()
+                        if now - last_err > 1.0:
+                            print(f"\n    已离估计位置 {JOG_LIMIT:g} mm：确认纸没放错（可按 R 回到估计位置）")
+                            last_err = now
+                    if up:
+                        aim_xy = nxt
+                    elif pl.grip != GRIP_OPEN_DEG:
+                        now = time.perf_counter()
+                        if now - last_err > 1.0:
+                            print("\n    夹爪闭合中，先按 O 张开再移动")
+                            last_err = now
+                    elif not np.allclose(nxt, xy):
+                        try:
+                            q_new = solve_ik(np.array([nxt[0], nxt[1], zg]), pitch, q)
+                            q, xy = q_new, nxt
+                            ser.write(pack_frame(np.deg2rad(np.append(q, pl.grip))))
+                            ser.flush()
+                        except IKError as e:
+                            now = time.perf_counter()
+                            if now - last_err > 1.0:
+                                print(f"\n    该方向不可达：{e}")
+                                last_err = now
+                now = time.perf_counter()
+                if now - last_print > 0.2:
+                    cur = aim_xy if up else xy
+                    d = cur - guess
+                    print(f"\r  [{k}] x={cur[0]:7.1f}  y={cur[1]:7.1f} mm  相对估计 ({d[0]:+5.1f}, {d[1]:+5.1f})  "
+                          f"z={zg:.1f}  {'微调' if speed == JOG_SLOW else '常速'}{'  [已升起]' if up else '      '}",
+                          end="", flush=True)
+                    last_print = now
+                tick += SEND_PERIOD_S
+                rem = tick - time.perf_counter()
+                if rem > 0:
+                    time.sleep(rem)
+                else:
+                    tick = time.perf_counter()
+        finally:
+            if not np.allclose(q, pl.q):
+                sync_jog(q)
+            print()
+            _flush_console_input()
+
+    # ---------- 每个点的微调：输入指令 ----------
+    def jog_text(k, guess, pitch):
+        step, up, aim_xy = 1.0, False, grip_point(pl.q)[:2].copy()
+        while True:
+            here = aim_xy if up else grip_point(pl.q)[:2]
+            d = here - guess
+            cmd = input(f"  [{k}] ({here[0]:.1f}, {here[1]:.1f})  相对估计 ({d[0]:+.1f}, {d[1]:+.1f})"
+                        f"  步长 {step:g}{'  [已升起]' if up else ''} > ").strip().lower()
+            if not cmd:
+                continue
+            if cmd in ("h", "help", "?"):
+                print(CALIB_HELP)
+                continue
+            if cmd == "q":
+                return "quit", None
+            if cmd == "skip":
+                return "skip", None
+            if cmd == "ok":
+                return "ok", here.copy()
+            if cmd.startswith("step"):
+                try:
+                    step = max(0.1, float(cmd.split()[1]))
+                except (IndexError, ValueError):
+                    print("    用法：step 0.5")
+                continue
+            if cmd in ("c", "o"):
+                if up:
+                    print("    先 down 降到夹取高度")
+                    continue
+                safe(pl.gripper, "标定/试夹" if cmd == "c" else "标定/张开",
+                     GRIP_CLOSE_DEG if cmd == "c" else GRIP_OPEN_DEG)
+                continue
+            if cmd == "up":
+                if not up:
+                    if pl.grip != GRIP_OPEN_DEG:
+                        safe(pl.gripper, "标定/张开", GRIP_OPEN_DEG)
+                    aim_xy = grip_point(pl.q)[:2].copy()
+                    up = safe(pl.rise, "标定/升起")
+                continue
+            if cmd == "down":
+                if up and go_aim(aim_xy, pitch, f"标定/{k}"):
+                    up = False
+                continue
+            if cmd == "r":
+                if up:
+                    aim_xy = guess.copy()
+                else:
+                    safe(pl.line, "标定/回估计", np.array([guess[0], guess[1], zg]), pitch, SLOW_SPEED * 2)
+                continue
+            m = re.fullmatch(r"([xy])\s*([+-]\s*\d+(?:\.\d*)?)", cmd)
+            if m:
+                v = float(m.group(2).replace(" ", ""))
+                delta = np.array([v, 0.0]) if m.group(1) == "x" else np.array([0.0, v])
+            elif re.fullmatch(r"[wasd]+", cmd):
+                delta = step * np.array([cmd.count("w") - cmd.count("s"), cmd.count("a") - cmd.count("d")], float)
+            else:
+                print("    无法识别，输入 h 查看指令")
+                continue
+            if up:
+                aim_xy = aim_xy + delta          # 升起状态只改目标，down 时到位
+                continue
+            if pl.grip != GRIP_OPEN_DEG:
+                print("    夹爪闭合中，先 o 张开再移动")
+                continue
+            if np.linalg.norm(here + delta - guess) > JOG_LIMIT:
+                print(f"    离估计位置超过 {JOG_LIMIT:g} mm：确认纸没有放错")
+                continue
+            safe(pl.line, "标定/微调", np.array([here[0] + delta[0], here[1] + delta[1], zg]), pitch, SLOW_SPEED * 2)
+
     try:
         pl.start_from_zero(guess0[order[0]])
         flush()
@@ -1256,78 +1502,11 @@ def run_calib(port, only=None, path=CALIB_FILE):
             if not go_aim(guess, pitch, f"标定/{k}"):
                 print("    估计位置不可达，跳过该点（检查纸的摆放）")
                 continue
-            step, up, aim_xy = 1.0, False, grip_point(pl.q)[:2].copy()
-            while True:
-                here = aim_xy if up else grip_point(pl.q)[:2]
-                d = here - guess
-                cmd = input(f"  [{k}] ({here[0]:.1f}, {here[1]:.1f})  相对估计 ({d[0]:+.1f}, {d[1]:+.1f})"
-                            f"  步长 {step:g}{'  [已升起]' if up else ''} > ").strip().lower()
-                if not cmd:
-                    continue
-                if cmd in ("h", "help", "?"):
-                    print(CALIB_HELP)
-                    continue
-                if cmd == "q":
-                    quit_all = True
-                    break
-                if cmd == "skip":
-                    break
-                if cmd == "ok":
-                    measured[k] = here.copy()
-                    print(f"    已记录 {k} = ({here[0]:.1f}, {here[1]:.1f})")
-                    break
-                if cmd.startswith("step"):
-                    try:
-                        step = max(0.1, float(cmd.split()[1]))
-                    except (IndexError, ValueError):
-                        print("    用法：step 0.5")
-                    continue
-                if cmd in ("c", "o"):
-                    if up:
-                        print("    先 down 降到夹取高度")
-                        continue
-                    safe(pl.gripper, "标定/试夹" if cmd == "c" else "标定/张开",
-                         GRIP_CLOSE_DEG if cmd == "c" else GRIP_OPEN_DEG)
-                    continue
-                if cmd == "up":
-                    if not up:
-                        if pl.grip != GRIP_OPEN_DEG:
-                            safe(pl.gripper, "标定/张开", GRIP_OPEN_DEG)
-                        aim_xy = grip_point(pl.q)[:2].copy()
-                        up = safe(pl.rise, "标定/升起")
-                    continue
-                if cmd == "down":
-                    if up and go_aim(aim_xy, pitch, f"标定/{k}"):
-                        up = False
-                    continue
-                if cmd == "r":
-                    if up:
-                        aim_xy = guess.copy()
-                    else:
-                        safe(pl.line, "标定/回估计", np.array([guess[0], guess[1], zg]), pitch, SLOW_SPEED * 2)
-                    continue
-                # 移动指令
-                m = re.fullmatch(r"([xy])\s*([+-]\s*\d+(?:\.\d*)?)", cmd)
-                if m:
-                    v = float(m.group(2).replace(" ", ""))
-                    delta = np.array([v, 0.0]) if m.group(1) == "x" else np.array([0.0, v])
-                elif re.fullmatch(r"[wasd]+", cmd):
-                    delta = step * np.array([cmd.count("w") - cmd.count("s"), cmd.count("a") - cmd.count("d")], float)
-                else:
-                    print("    无法识别，输入 h 查看指令")
-                    continue
-                if up:
-                    aim_xy = aim_xy + delta          # 升起状态只改目标，down 时到位
-                    continue
-                if pl.grip != GRIP_OPEN_DEG:
-                    print("    夹爪闭合中，先 o 张开再移动")
-                    continue
-                if np.linalg.norm(here + delta - guess) > 15.0:
-                    print("    离估计位置超过 15 mm：确认纸没有放错（或用 up 后整体移动纸）")
-                    continue
-                tgt = np.array([here[0] + delta[0], here[1] + delta[1], zg])
-                safe(pl.line, "标定/微调", tgt, pitch, SLOW_SPEED * 2)
-            if quit_all:
+            res, xy = (jog_keys if kb else jog_text)(k, guess, pitch)
+            if res == "ok":
+                measured[k] = np.asarray(xy, float)
+                print(f"    已记录 {k} = ({xy[0]:.1f}, {xy[1]:.1f}) mm")
+            elif res == "quit":
                 break
         if pl.grip != GRIP_OPEN_DEG:
             safe(pl.gripper, "标定/张开", GRIP_OPEN_DEG)
@@ -1338,7 +1517,7 @@ def run_calib(port, only=None, path=CALIB_FILE):
         ser.close()
     if measured:
         save_calib(path, nominal, measured, point_pitches(predict_points(nominal, measured)))
-        print("之后的 plan / simulate / hardware 会自动使用该标定（--no-calib 可忽略）。")
+        print(f"之后的 plan / simulate / hardware 会自动使用这套 x、y（z 固定按桌面 {TABLE_Z} mm），--no-calib 可忽略。")
     else:
         print("没有记录任何点，未保存。")
 
@@ -1401,6 +1580,7 @@ def main():
     ap.add_argument("--calib-file", default=str(CALIB_FILE), help="圆心标定文件（--mode calib 生成）")
     ap.add_argument("--no-calib", action="store_true", help="忽略标定文件，用作业纸名义几何")
     ap.add_argument("--only", help="calib：只标定这些点，如 s1,t3（其余沿用已有标定）")
+    ap.add_argument("--text-jog", action="store_true", help="calib：不用实时键盘，改用输入指令微调")
     ap.add_argument("--step", action="store_true", help="每次夹紧/松开前回车确认")
     ap.add_argument("--pause-between", action="store_true", help="必做与选做之间暂停确认")
     ap.add_argument("--speed", type=float, default=4.0, help="仿真回放倍速")
@@ -1433,7 +1613,7 @@ def main():
         only = [x.strip() for x in args.only.split(",")] if args.only else None
         if only and any(x not in POINT_NAMES for x in only):
             raise SystemExit(f"--only 只能是 {POINT_NAMES} 中的点")
-        run_calib(args.port, only=only, path=Path(args.calib_file))
+        run_calib(args.port, only=only, path=Path(args.calib_file), use_keyboard=not args.text_jog)
         return
 
     calib_path = Path(args.calib_file)
