@@ -10,7 +10,8 @@
     python week8/transport.py --mode scan                       # 各点俯仰窗口、每趟倾角、推荐作业纸摆放
     python week8/transport.py --mode plan --task 1              # 规划+离线检查，导出 CSV/JSON/PNG
     python week8/transport.py --mode simulate --task 2          # 三维动画（必做后接选做）
-    python week8/transport.py --mode calib --port COM5          # 实机：张爪依次悬停在 6 个圆心上方，核对位置
+    python week8/transport.py --mode calib --port COM5          # 实机：逐点微调夹爪对准 6 个圆心并记录
+    python week8/transport.py --mode calib --port COM5 --only t3   # 只重标某几个点
     python week8/transport.py --mode hardware --task 1 --port COM5 [--step]
     python week8/transport.py --mode hardware --task 2 --port COM5        # 必做 + 选做连续执行
 
@@ -27,6 +28,8 @@
    实际姿态，把最低棱停在纸面上方 RELEASE_GAP 处再松爪：倾斜绕切向水平轴，着地的是整条棱，
    木块翻平时底面中心水平移动 < 1 mm。离线检查给出每趟倾角和“底面距圆边界”的余量。
 5. 安全：木块只在越障高度横移；中止（Ctrl+C）只停止下发、绝不松爪。
+6. 圆心标定（--mode calib）：夹爪以实际夹取姿态停在各圆心估计位置，键盘微调到两指中点对准圆心后记录，
+   存入 week8/sheet_calib.json；plan / simulate / hardware 自动读取。标定后纸不能再动。
 
 坐标系与 week5~week7 的 D-H 模型一致（基座系，mm），桌面 z = TABLE_Z。
 作业纸坐标：u 轴由 s 列指向 t 列，v 轴由第 3 行指向第 1 行；默认 u = +X_B（远离机械臂），
@@ -109,6 +112,8 @@ SHEET_CENTER_XY = (260.0, 0.0)   # 作业纸中心（s2、t2 圆心连线中点�
 SHEET_YAW_DEG = 0.0              # u 轴（s→t）相对 +X_B 的转角
 
 POINT_XY_OVERRIDE = {}           # 实测圆心：{"s1": (x, y), ...}；给出后覆盖上面的作业纸几何
+CALIB_FILE = Path(__file__).resolve().parent / "sheet_calib.json"   # --mode calib 的记录，存在即自动加载
+CALIB_SOURCE = ""
 PLACE_XY_COMP = {}               # 逐点放置补偿 {"t1": (dx, dy), ...}（实机标定）
 PICK_XY_COMP = {}                # 逐点夹取补偿
 GRASP_Z_OFFSET = 0.0             # 夹取点相对木块中心的高度（+ 为偏上）
@@ -282,7 +287,7 @@ def best_pitch(p, margin=JOINT_MARGIN_DEG + 2.0):
 
 def sheet_points(center_xy=None, yaw_deg=None):
     """六个圆心在基座系中的 (x, y)。"""
-    if POINT_XY_OVERRIDE:
+    if POINT_XY_OVERRIDE and center_xy is None and yaw_deg is None:
         return {k: np.asarray(v, float) for k, v in POINT_XY_OVERRIDE.items()}
     cx, cy = SHEET_CENTER_XY if center_xy is None else center_xy
     yaw = np.deg2rad(SHEET_YAW_DEG if yaw_deg is None else yaw_deg)
@@ -656,9 +661,14 @@ class Planner:
         self.under = name
 
     def go_home(self, label):
+        self.state = "HOME"
+        self.rise(label)
+        self.movej(f"{label}/回零", np.zeros(5), duration=3.0)
+
+    def rise(self, label):
+        """原地竖直升到越障高度（先保持俯仰，到头后再边升边转）。"""
         here = grip_point(self.q)
         zt = max(self.transit_z(), here[2])
-        self.state = "HOME"
         if zt - here[2] > 0.5:
             pt = tool_pitch(self.q)
             z_c = const_pitch_top(here, pt, zt)
@@ -671,7 +681,6 @@ class Planner:
                         self.line(f"{label}/上升转角", np.array([here[0], here[1], zt]), a,
                                   VERTICAL_SPEED, target=self.under)
                         break
-        self.movej(f"{label}/回零", np.zeros(5), duration=3.0)
 
     def start_from_zero(self, first_xy):
         self.state = "READY"
@@ -865,8 +874,12 @@ def describe_layout(points):
 
 def summarize(pl):
     L = [f"\n========== 第八周 定点搬运（任务 {'必做' if pl.task == 1 else '必做 + 选做'}） =========="]
-    L.append(f"作业纸：中心 {SHEET_CENTER_XY}，u 轴转角 {SHEET_YAW_DEG:.0f}°，列距 {col_pitch():.1f}、行距 {row_pitches()[0]:.1f}/{row_pitches()[1]:.1f}、"
-             f"圆直径 {CIRCLE_DIAMETER:.1f} mm；桌面 z={TABLE_Z}")
+    if POINT_XY_OVERRIDE:
+        L.append(f"圆心来源：手动标定（{CALIB_SOURCE or '程序内 POINT_XY_OVERRIDE'}）；圆直径 {CIRCLE_DIAMETER:.1f} mm；"
+                 f"桌面 z={TABLE_Z}")
+    else:
+        L.append(f"作业纸：中心 {SHEET_CENTER_XY}，u 轴转角 {SHEET_YAW_DEG:.0f}°，列距 {col_pitch():.1f}、"
+                 f"行距 {row_pitches()[0]:.1f}/{row_pitches()[1]:.1f}、圆直径 {CIRCLE_DIAMETER:.1f} mm；桌面 z={TABLE_Z}")
     L.append("圆心位置（基座系）：\n" + describe_layout(pl.points))
     L.append("每趟搬运（夹取俯仰 → 放置俯仰，差值即放下时木块倾角）：")
     for tr, pc in zip(pl.transfers, pl.placements):
@@ -1095,6 +1108,242 @@ def execute(ser, pl, step=False, pause_between=False):
 
 
 # ============================================================
+# 10b. 手动标定圆心（--mode calib）
+# ============================================================
+# 思路：夹爪以“实际夹取时的姿态（同一俯仰、同一高度）”停在每个圆心的估计位置，人用键盘微调，
+# 直到两指中点正对圆心，记录此刻的指令坐标。这样记录下来的就是“让夹爪对准圆心该发的指令”，
+# 机械臂本身的标定误差（连杆、零位、下垂）在该点附近一并被吸收。
+
+CALIB_ORDER = ("s2", "t2", "s1", "t1", "s3", "t3")
+CALIB_HELP = """  w / s ：沿 +X / -X 移动（远离 / 靠近机械臂）   a / d ：沿 +Y / -Y 移动（站在机械臂身后看：向左 / 向右）
+  可连写（www、dd 各走 3 步、2 步）；x+1.5、y-2 直接按毫米移动；step 0.5 修改步长（默认 1 mm）
+  c / o ：夹紧 / 张开（放一块木块试夹：夹紧时木块往哪边被推，夹爪就偏向另一边）
+  up    ：原地升到越障高度（此时可在圆内放、取木块）   down：降回夹取高度
+  ok    ：记录当前位置，去下一个点        r：回到本点初始估计      skip：跳过本点      q：保存并退出"""
+
+
+def fit_similarity(src, dst):
+    """二维相似变换 dst ≈ k·R·src + t（Umeyama）。返回 (k, 转角 deg, t, 变换函数)。"""
+    A, B = np.asarray(src, float), np.asarray(dst, float)
+    if len(A) == 1:
+        t = B[0] - A[0]
+        return 1.0, 0.0, t, (lambda p: np.asarray(p, float) + t)
+    ma, mb = A.mean(0), B.mean(0)
+    A0, B0 = A - ma, B - mb
+    U, S, Vt = np.linalg.svd(B0.T @ A0 / len(A))
+    D = np.diag([1.0, np.sign(np.linalg.det(U @ Vt)) or 1.0])
+    R = U @ D @ Vt
+    k = float(np.trace(np.diag(S) @ D) * len(A) / (A0 ** 2).sum())
+    t = mb - k * R @ ma
+    return k, float(np.degrees(np.arctan2(R[1, 0], R[0, 0]))), t, (lambda p: k * R @ np.asarray(p, float) + t)
+
+
+def predict_points(nominal, measured):
+    """用已标定的点把名义几何整体平移/旋转/缩放过去，估计其余点。"""
+    if not measured:
+        return {k: np.asarray(v, float) for k, v in nominal.items()}
+    keys = list(measured)
+    f = fit_similarity([nominal[k] for k in keys], [measured[k] for k in keys])[3]
+    return {k: (np.asarray(measured[k], float) if k in measured else f(nominal[k])) for k in nominal}
+
+
+def point_pitches(points):
+    """每个圆心在任务中实际使用的俯仰（取或放），标定就在这个姿态下做。"""
+    trs, _ = plan_transfers(2, points)
+    out = {}
+    for tr in trs:
+        out.setdefault(tr["from"], tr["pick_pitch"])
+        out.setdefault(tr["to"], tr["place_pitch"])
+    return out
+
+
+def load_calib(path):
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    return {k: np.asarray(v, float) for k, v in data["points"].items()}, data
+
+
+def save_calib(path, nominal, measured, pitches):
+    pts = predict_points(nominal, measured)
+    data = {"time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "points": {k: [round(float(v[0]), 2), round(float(v[1]), 2)] for k, v in pts.items()},
+            "measured": sorted(measured),
+            "pitch_deg": {k: round(float(v), 2) for k, v in pitches.items()},
+            "nominal": {k: [round(float(v[0]), 2), round(float(v[1]), 2)] for k, v in nominal.items()}}
+    lines = []
+    if len(measured) >= 3:
+        keys = sorted(measured)
+        k, th, t, f = fit_similarity([nominal[x] for x in keys], [measured[x] for x in keys])
+        res = {x: float(np.linalg.norm(f(nominal[x]) - measured[x])) for x in keys}
+        data["fit"] = {"scale": round(k, 4), "rot_deg": round(th, 2), "shift_mm": [round(float(v), 2) for v in t],
+                       "residual_mm": {x: round(v, 2) for x, v in res.items()}}
+        lines.append(f"相对名义摆放：平移 ({t[0]:+.1f}, {t[1]:+.1f}) mm，转角 {th:+.2f}°，比例 {k:.4f}")
+        lines.append("各点对整体刚性拟合的残差：" + "，".join(f"{x} {v:.1f}" for x, v in res.items()) + " mm")
+        bad = [x for x, v in res.items() if v > 3.0]
+        if bad:
+            lines.append(f"注意：{bad} 残差 > 3 mm，可能对歪了，建议 --only {','.join(bad)} 重标")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+    print(f"\n已保存 {path}")
+    for k in POINT_NAMES:
+        tag = "标定" if k in measured else "推算"
+        d = pts[k] - nominal[k]
+        print(f"  {k}: ({pts[k][0]:6.1f}, {pts[k][1]:6.1f}) mm  [{tag}]  相对名义 ({d[0]:+.1f}, {d[1]:+.1f})")
+    for ln in lines:
+        print(ln)
+
+
+def run_calib(port, only=None, path=CALIB_FILE):
+    nominal = sheet_points(SHEET_CENTER_XY, SHEET_YAW_DEG)          # 名义几何（不读已有标定）
+    measured = {}
+    if only and Path(path).exists():
+        old, _ = load_calib(path)
+        measured = {k: v for k, v in old.items() if k not in only}
+    order = [k for k in CALIB_ORDER if not only or k in only]
+    guess0 = predict_points(nominal, measured)
+    pitches = point_pitches(guess0)
+    zg = TABLE_Z + BLOCK_SIZE / 2 + GRASP_Z_OFFSET
+
+    pl = Planner(1, guess0)
+    pl.occupant = {}
+    # 标定时纸上可能放着一块试夹用的木块：越障高度按“任意圆内有一块木块”计算
+    pl.blocks = {"标定块": (block_center_at(guess0["s2"]), 0.0)}
+
+    print("手动标定圆心：夹爪以实际夹取时的姿态停在每个圆心的估计位置（指尖离纸约 5 mm），")
+    print("用键盘把两指中点对准圆心后输入 ok 记录。纸先用胶带固定，标定后不要再动。")
+    print("对准方法：① 从正上方看两指尖连线中点是否落在圆心；② 更准：up 升起后在圆内居中放一块木块")
+    print("（一个面正对机械臂底座，四边到圆的距离相等），down 降下后 c 试夹，看木块被推向哪边再微调。")
+    print(CALIB_HELP)
+    print("顺序：" + " → ".join(order))
+    if input("确认纸上没有木块、撤手后输入 YES 开始：").strip().upper() != "YES":
+        return
+    ser = init_serial(port)
+    sent = [0]
+
+    def flush():
+        for seg in pl.segments[sent[0]:]:
+            stream(ser, seg.q)
+        sent[0] = len(pl.segments)
+
+    def safe(fn, *a):
+        n0, q0, g0, u0 = len(pl.segments), pl.q.copy(), pl.grip, pl.under
+        try:
+            fn(*a)
+            flush()
+            return True
+        except IKError as e:
+            del pl.segments[n0:]
+            pl.q, pl.grip, pl.under = q0, g0, u0
+            print(f"    不可达：{e}")
+            return False
+
+    def go_aim(xy, pitch, label):
+        def _do():
+            pl.travel_to_hover(label, np.array([xy[0], xy[1], zg + APPROACH]), pitch, None)
+            pl.vertical(f"{label}/下降", zg, VERTICAL_SPEED)
+        return safe(_do)
+
+    quit_all = False
+    try:
+        pl.start_from_zero(guess0[order[0]])
+        flush()
+        for k in order:
+            guess = predict_points(nominal, measured)[k]
+            pitch = pitches[k]
+            print(f"\n── {k}：估计 ({guess[0]:.1f}, {guess[1]:.1f}) mm，俯仰 {pitch:.1f}°")
+            if pl.grip != GRIP_OPEN_DEG:
+                safe(pl.gripper, "标定/张开", GRIP_OPEN_DEG)
+            if not go_aim(guess, pitch, f"标定/{k}"):
+                print("    估计位置不可达，跳过该点（检查纸的摆放）")
+                continue
+            step, up, aim_xy = 1.0, False, grip_point(pl.q)[:2].copy()
+            while True:
+                here = aim_xy if up else grip_point(pl.q)[:2]
+                d = here - guess
+                cmd = input(f"  [{k}] ({here[0]:.1f}, {here[1]:.1f})  相对估计 ({d[0]:+.1f}, {d[1]:+.1f})"
+                            f"  步长 {step:g}{'  [已升起]' if up else ''} > ").strip().lower()
+                if not cmd:
+                    continue
+                if cmd in ("h", "help", "?"):
+                    print(CALIB_HELP)
+                    continue
+                if cmd == "q":
+                    quit_all = True
+                    break
+                if cmd == "skip":
+                    break
+                if cmd == "ok":
+                    measured[k] = here.copy()
+                    print(f"    已记录 {k} = ({here[0]:.1f}, {here[1]:.1f})")
+                    break
+                if cmd.startswith("step"):
+                    try:
+                        step = max(0.1, float(cmd.split()[1]))
+                    except (IndexError, ValueError):
+                        print("    用法：step 0.5")
+                    continue
+                if cmd in ("c", "o"):
+                    if up:
+                        print("    先 down 降到夹取高度")
+                        continue
+                    safe(pl.gripper, "标定/试夹" if cmd == "c" else "标定/张开",
+                         GRIP_CLOSE_DEG if cmd == "c" else GRIP_OPEN_DEG)
+                    continue
+                if cmd == "up":
+                    if not up:
+                        if pl.grip != GRIP_OPEN_DEG:
+                            safe(pl.gripper, "标定/张开", GRIP_OPEN_DEG)
+                        aim_xy = grip_point(pl.q)[:2].copy()
+                        up = safe(pl.rise, "标定/升起")
+                    continue
+                if cmd == "down":
+                    if up and go_aim(aim_xy, pitch, f"标定/{k}"):
+                        up = False
+                    continue
+                if cmd == "r":
+                    if up:
+                        aim_xy = guess.copy()
+                    else:
+                        safe(pl.line, "标定/回估计", np.array([guess[0], guess[1], zg]), pitch, SLOW_SPEED * 2)
+                    continue
+                # 移动指令
+                m = re.fullmatch(r"([xy])\s*([+-]\s*\d+(?:\.\d*)?)", cmd)
+                if m:
+                    v = float(m.group(2).replace(" ", ""))
+                    delta = np.array([v, 0.0]) if m.group(1) == "x" else np.array([0.0, v])
+                elif re.fullmatch(r"[wasd]+", cmd):
+                    delta = step * np.array([cmd.count("w") - cmd.count("s"), cmd.count("a") - cmd.count("d")], float)
+                else:
+                    print("    无法识别，输入 h 查看指令")
+                    continue
+                if up:
+                    aim_xy = aim_xy + delta          # 升起状态只改目标，down 时到位
+                    continue
+                if pl.grip != GRIP_OPEN_DEG:
+                    print("    夹爪闭合中，先 o 张开再移动")
+                    continue
+                if np.linalg.norm(here + delta - guess) > 15.0:
+                    print("    离估计位置超过 15 mm：确认纸没有放错（或用 up 后整体移动纸）")
+                    continue
+                tgt = np.array([here[0] + delta[0], here[1] + delta[1], zg])
+                safe(pl.line, "标定/微调", tgt, pitch, SLOW_SPEED * 2)
+            if quit_all:
+                break
+        if pl.grip != GRIP_OPEN_DEG:
+            safe(pl.gripper, "标定/张开", GRIP_OPEN_DEG)
+        safe(pl.go_home, "标定")
+    except KeyboardInterrupt:
+        print("\n已中止下发。")
+    finally:
+        ser.close()
+    if measured:
+        save_calib(path, nominal, measured, point_pitches(predict_points(nominal, measured)))
+        print("之后的 plan / simulate / hardware 会自动使用该标定（--no-calib 可忽略）。")
+    else:
+        print("没有记录任何点，未保存。")
+
+
+# ============================================================
 # 11. 扫描：推荐作业纸摆放
 # ============================================================
 
@@ -1127,7 +1376,7 @@ def run_scan():
     for worst, nn, R, yaw in rows[:8]:
         print(f"  中心 ({R:.1f}, 0)  u 轴转角 {yaw:+.1f}°  最大倾角 {worst:.1f}°  最窄俯仰窗口 {-nn:.1f}°")
     print("\n摆放方法：作业纸 s 列靠近机械臂、t 列远离，s1/t1 在左侧（站在机械臂身后看）。"
-          "先用 --mode calib 让夹爪停在 s2、t2 圆心上方，移动纸使两个圆心正对两指中间。")
+          "按上面的位置摆好纸并用胶带固定，再用 --mode calib 逐点标定圆心。")
 
 
 # ============================================================
@@ -1136,7 +1385,7 @@ def run_scan():
 
 def main():
     global SHEET_CENTER_XY, SHEET_YAW_DEG, SHEET_SCALE_U, SHEET_SCALE_V, CIRCLE_DIAMETER, GRIP_CLOSE_DEG, RELEASE_GAP
-    global POSITION_TOLERANCE
+    global POSITION_TOLERANCE, POINT_XY_OVERRIDE, CALIB_SOURCE
     ap = argparse.ArgumentParser(description="第八周：机械臂定点搬运（必做 + 选做）")
     ap.add_argument("--mode", choices=("plan", "simulate", "hardware", "calib", "scan"), default="plan")
     ap.add_argument("--task", type=int, choices=(1, 2), default=1, help="1：必做；2：必做后接着做选做")
@@ -1149,6 +1398,9 @@ def main():
     ap.add_argument("--circle", type=float, help="实测区域圆直径（mm）")
     ap.add_argument("--grip-close", type=float, help="夹爪闭合角（deg）")
     ap.add_argument("--release-gap", type=float, help="松爪时木块最低棱离纸面（mm）")
+    ap.add_argument("--calib-file", default=str(CALIB_FILE), help="圆心标定文件（--mode calib 生成）")
+    ap.add_argument("--no-calib", action="store_true", help="忽略标定文件，用作业纸名义几何")
+    ap.add_argument("--only", help="calib：只标定这些点，如 s1,t3（其余沿用已有标定）")
     ap.add_argument("--step", action="store_true", help="每次夹紧/松开前回车确认")
     ap.add_argument("--pause-between", action="store_true", help="必做与选做之间暂停确认")
     ap.add_argument("--speed", type=float, default=4.0, help="仿真回放倍速")
@@ -1178,35 +1430,18 @@ def main():
         return
 
     if args.mode == "calib":
-        pl = Planner(1)
-        pl.blocks = {}                     # 标定时纸上不放木块
-        pts = pl.points
-        pl.start_from_zero(pts["s2"])
-        stops = []
-        for k in ("s2", "t2", "s1", "t1", "s3", "t3"):     # 先 s2、t2 定位置与方向，再核对其余四点
-            hover = np.array([pts[k][0], pts[k][1], TABLE_Z + BLOCK_SIZE + 20.0])
-            pl.travel_to_hover(f"标定/{k}", hover, best_pitch(hover), target=None)
-            stops.append((k, len(pl.segments)))
-        pl.go_home("标定")
-        print("标定：取走纸上所有木块。夹爪将张开依次停在 6 个圆心上方约 20 mm（块顶高度以上）。")
-        print(describe_layout(pts))
-        if input("撤手后输入 YES 开始：").strip().upper() != "YES":
-            return
-        ser = init_serial(args.port)
-        try:
-            start = 0
-            for k, end in stops:
-                for seg in pl.segments[start:end]:
-                    stream(ser, seg.q)
-                start = end
-                tip = ("移动作业纸，使该圆心正对两指中间" if k in ("s2", "t2")
-                       else "核对偏差（>3 mm 时写入 PICK/PLACE_XY_COMP 或微调纸的转角）")
-                input(f"  已停在 {k} 上方：{tip}，回车继续")
-            for seg in pl.segments[start:]:
-                stream(ser, seg.q)
-        finally:
-            ser.close()
+        only = [x.strip() for x in args.only.split(",")] if args.only else None
+        if only and any(x not in POINT_NAMES for x in only):
+            raise SystemExit(f"--only 只能是 {POINT_NAMES} 中的点")
+        run_calib(args.port, only=only, path=Path(args.calib_file))
         return
+
+    calib_path = Path(args.calib_file)
+    if not args.no_calib and calib_path.exists():
+        pts, data = load_calib(calib_path)
+        POINT_XY_OVERRIDE = pts
+        CALIB_SOURCE = f"{calib_path.name}，{data.get('time', '')}，实测 {','.join(data.get('measured', []))}"
+        print(f"使用圆心标定：{CALIB_SOURCE}（--no-calib 可忽略）")
 
     pl = build_plan(args.task)
     check_plan(pl, raise_on_fail=(args.mode == "hardware"))

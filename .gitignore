@@ -21,3 +21,6 @@ week6/stack_output/
 
 # 第八周离线规划导出
 week8/transport_output/
+
+# 第八周圆心标定（随纸的摆放而变，不入库）
+week8/sheet_calib.json
